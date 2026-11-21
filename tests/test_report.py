@@ -79,7 +79,8 @@ def test_report_pending_run_never_picked_even_if_passed():
 def test_report_table_shows_pending_per_trait():
     text = format_table({"pend": _pending(_eval(x=_trait(True), y=_trait(False))), "done": _eval(x=_trait(True))})
     pend_row = [ln for ln in text.splitlines() if ln.startswith("pend")][0]
-    assert pend_row.split().count("PENDING") == 2 and "PASS" not in pend_row and "FAIL" not in pend_row
+    assert pend_row.split().count("PENDING") == 2 and "PASS" not in pend_row
+    assert "PENDING (FAIL: kl@c=+1)" in pend_row  # y already fails a teacher-forced check
     assert "PASS" in [ln for ln in text.splitlines() if ln.startswith("done")][0]
 
 
@@ -95,3 +96,12 @@ def test_report_cli_pending_not_picked(tmp_path, capsys):
     assert cli.main(["report", "--out", str(tmp_path), "--runs", "pend"]) == 0
     out = capsys.readouterr().out
     assert "PENDING" in out and "no run passes" in out
+
+
+def test_report_pending_run_shows_teacher_forced_failures():
+    ev = _pending(_eval(x=_trait(True), y=_trait(False, failed=["kl@c=+1", "persona@c=-1"])))
+    text = format_table({"pend": ev})
+    row = [ln for ln in text.splitlines() if ln.startswith("pend")][0]
+    assert "PENDING (FAIL: kl@c=+1, persona@c=-1)" in row and row.count("PENDING") == 2
+    assert "PASS" not in row
+    assert pick_run({"pend": ev}) is None

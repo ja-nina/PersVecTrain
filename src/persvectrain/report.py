@@ -41,14 +41,15 @@ def pick_run(evals: dict[str, dict]) -> str | None:
 
 
 def _cell(trait_eval: dict, pending: bool = False) -> str:
-    if pending:
-        return "PENDING"
     p = trait_eval["pass"]
+    if pending:  # a teacher-forced check failing already is final: free generation cannot make it pass
+        return "PENDING (FAIL: " + ", ".join(p["failed"]) + ")" if p.get("failed") else "PENDING"
     return "PASS" if p["passed"] else "FAIL (" + ", ".join(p["failed"]) + ")"
 
 
 def format_table(evals: dict[str, dict]) -> str:
-    """Rows: runs; columns: traits (union, in first-seen order); cells PASS or FAIL (failed checks), PENDING while free generation is pending."""
+    """Rows: runs; columns: traits (union, in first-seen order); cells PASS or FAIL (failed checks), PENDING
+    while free generation is pending (PENDING (FAIL: ...) when a teacher-forced check already fails)."""
     traits: list[str] = []
     for ev in evals.values():
         traits += [t for t in ev["traits"] if t not in traits]
