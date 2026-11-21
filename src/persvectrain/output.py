@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from dataclasses import asdict
@@ -15,7 +16,7 @@ import torch
 from persvecfast.extract import RANDOM_CONTROL_SEED, random_control, vector_file
 from persvecfast.util import read_json, save_pt, write_json
 
-from persvectrain.train import TrainConfig
+from persvectrain.train import RefAnswer, TrainConfig
 
 REPO = Path(__file__).resolve().parents[2]
 PERSVECFAST_REPO = Path(persvecfast.__file__).resolve().parents[2]
@@ -114,3 +115,30 @@ def build_train_json(cfg: TrainConfig, sources: dict, layer_type: str | None, dr
         "dropped_traits": dict(dropped_traits),
         "splits": splits,
     }
+
+
+# ---------------------------------------------------------------- reading a run back
+
+
+def config_from_train_json(meta: dict, out: Path) -> TrainConfig:
+    """The run's TrainConfig from its train.json, with `out` the out root the run is read from."""
+    kw = dict(meta["config"])
+    kw["source"], kw["out"] = Path(kw["source"]), Path(out).resolve()
+    return TrainConfig(**kw)
+
+
+def load_reference(path: Path) -> list[RefAnswer]:
+    rows = [json.loads(l) for l in Path(path).read_text(encoding="utf-8").splitlines() if l.strip()]
+    return [RefAnswer(id=r["id"], question=r["question"], answer_text=r["answer_text"], gold=r["gold"])
+            for r in rows]
+
+
+def load_trained(vec_dir: Path, slugs: list[str], layer: int) -> dict[str, torch.Tensor]:
+    """The run's trained vectors from vllm_hook/{slug}_L{layer}.pt, as fp32."""
+    out = {}
+    for slug in slugs:
+        path = vector_file(vec_dir, slug, layer)
+        if not path.exists():
+            raise SystemExit(f"trained vector {path} missing: training did not finish writing {slug}")
+        out[slug] = torch.load(path)["dir"].float()
+    return out

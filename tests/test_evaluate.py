@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 import torch
 from persvecfast.extract import RANDOM_CONTROL_SEED, random_control
-from persvecfast.smoke import decoder_layers
 
 from persvectrain import evaluate as ev
 from persvectrain.data import Pair
@@ -28,18 +27,20 @@ def _kind(margins, kls) -> dict:
     return {c: {"margins": list(margins), "kls": list(kls)} for c in CS}
 
 
-def _trait_eval(trained_m, source_m, trained_kl, source_kl, random_kl, tokens=None) -> dict:
+def _trait_eval(trained_m, source_m, trained_kl, source_kl, random_kl, tokens=None, correct=None) -> dict:
     """tokens: {"unsteered": u, "trained": t, "source_full": s, "trained_random": r}, each a per-prompt token
-    list (a number: that many tokens on every prompt), or None for no free generation."""
+    list (a number: that many tokens on every prompt), or None for no free generation. correct: the same for
+    the 0 / 1 correctness lists (default: every answer correct)."""
     kinds = {"trained": _kind(trained_m, trained_kl), "source_full": _kind(source_m, source_kl),
              "trained_random": _kind([0.0] * len(trained_m), random_kl)}
     te = {"kinds": kinds}
     if tokens is not None:
         n = len(trained_m)
         tok = {k: (list(v) if isinstance(v, (list, tuple)) else [v] * n) for k, v in tokens.items()}
-        fg = {"unsteered": {"tokens": tok["unsteered"]}}
+        cor = {k: list((correct or {}).get(k, [1] * n)) for k in tok}
+        fg = {"unsteered": {"tokens": tok["unsteered"], "correct": cor["unsteered"]}}
         for k in ("trained", "source_full", "trained_random"):
-            fg[k] = {c: {"tokens": tok[k]} for c in ("c=+1", "c=-1")}
+            fg[k] = {c: {"tokens": tok[k], "correct": cor[k]} for c in ("c=+1", "c=-1")}
         te["free_gen"] = fg
     return te
 
@@ -53,7 +54,7 @@ def test_pass_rule_all_better_passes():
     r = ev.pass_rule(te)
     assert r["passed"] is True and r["failed"] == [] and r["skipped"] == []
     assert set(r["checks"]) == {"c=+1", "c=-1"}
-    assert set(r["checks"]["c=+1"]) == {"persona", "kl", "length", "random"}
+    assert set(r["checks"]["c=+1"]) == {"persona", "kl", "length", "accuracy", "random"}
     assert all(chk["passed"] for c in r["checks"].values() for chk in c.values())
 
 
@@ -149,8 +150,43 @@ def test_pass_rule_without_free_gen_skips_length():
     te = _trait_eval([2] * 4, [1] * 4, [0.1] * 4, [1.0] * 4, [0.5] * 4, None)
     r = ev.pass_rule(te)
     assert r["passed"] is True
-    assert r["skipped"] == ["length@c=+1", "random-length@c=+1", "length@c=-1", "random-length@c=-1"]
-    assert "length" not in r["checks"]["c=+1"]
+    assert r["skipped"] == ["length@c=+1", "accuracy@c=+1", "random-length@c=+1",
+                            "length@c=-1", "accuracy@c=-1", "random-length@c=-1"]
+    assert "length" not in r["checks"]["c=+1"] and "accuracy" not in r["checks"]["c=+1"]
+
+
+def _acc_eval(trained_correct, source_correct) -> dict:
+    n = len(trained_correct)
+    return _trait_eval([2] * n, [1] * n, [0.1] * n, [1.0] * n, [0.5] * n, GOOD_TOKENS,
+                       correct={"trained": trained_correct, "source_full": source_correct})
+
+
+def test_pass_rule_accuracy_tie_within_one_se_passes():
+    # correct_trained - correct_source: 0, -1, 0, -1, 0, +1: mean -1/6, SE about 0.31
+    r = ev.pass_rule(_acc_eval([1, 0, 1, 0, 1, 1], [1, 1, 1, 1, 1, 0]))
+    acc = r["checks"]["c=+1"]["accuracy"]
+    assert acc["diff_mean"] == pytest.approx(-1 / 6) and -acc["diff_se"] <= acc["diff_mean"] < 0
+    assert acc["passed"] is True and r["passed"] is True
+
+
+def test_pass_rule_accuracy_lower_beyond_one_se_fails():
+    # 0, -1, -1, -1, -1, 0: mean -2/3, SE about 0.21
+    r = ev.pass_rule(_acc_eval([1, 0, 0, 0, 0, 1], [1, 1, 1, 1, 1, 1]))
+    acc = r["checks"]["c=+1"]["accuracy"]
+    assert acc["diff_mean"] == pytest.approx(-2 / 3) and acc["diff_mean"] < -acc["diff_se"]
+    assert r["failed"] == ["accuracy@c=+1", "accuracy@c=-1"] and r["passed"] is False
+
+
+def test_pass_rule_free_gen_needs_the_same_questions():
+    te = _acc_eval([1, 1], [1, 1])
+    for k in ("trained", "source_full", "trained_random"):
+        for c in ("c=+1", "c=-1"):
+            te["free_gen"][k][c]["qid"] = ["a", "b"]
+    te["free_gen"]["unsteered"]["qid"] = ["a", "b"]
+    assert ev.pass_rule(te)["passed"] is True
+    te["free_gen"]["source_full"]["c=+1"]["qid"] = ["b", "a"]
+    with pytest.raises(ValueError):
+        ev.pass_rule(te)
 
 
 def test_mean_se():
@@ -159,50 +195,7 @@ def test_mean_se():
     assert ev.mean_se([]) == (None, None)
 
 
-# ---------------------------------------------------------------- answer parsing / free generation
-
-
-@pytest.mark.parametrize("text,letter", [
-    ("... so the answer is C", "C"),
-    ("Answer: **B**.", "B"),
-    ("A first guess. The answer is (D), not A.", "D"),
-    ("The answer is C. Re-checking, the final ANSWER: E", "E"),
-    ("The answer is a mystery", None),
-    ("I pick C", None),
-])
-def test_parse_answer(text, letter):
-    assert ev.parse_answer(text) == letter
-
-
-def _fake_gen(texts, counts, seen):
-    def fake(model, tok, prompts, batch_size, max_new_tokens, **kw):
-        hooked = bool(decoder_layers(model)[LAYER]._forward_hooks)
-        seen.append({"prompts": list(prompts), "batch_size": batch_size, "max_new_tokens": max_new_tokens,
-                     "hooked": hooked, "sampling": {k: v for k, v in kw.items() if k != "label"},
-                     "rand": float(torch.rand(()))})
-        n = len(prompts)
-        return (texts * n)[:n], (counts * n)[:n]
-    return fake
-
-
-def test_free_generation_scores_with_fake_generate(tiny_model, char_tok, monkeypatch):
-    seen = []
-    monkeypatch.setattr(ev, "generate_counted", _fake_gen(["... answer is C"], [10, 30], seen))
-    refs = _refs(4)
-    r = ev.free_generation(tiny_model, char_tok, torch.ones(16), refs, seed=7, layer=LAYER, max_new_tokens=30,
-                           batch_size=3, sampling={"temperature": 0.7})
-    assert r["accuracy"] == 1.0 and r["accuracy_se"] == 0.0 and r["n"] == 4
-    assert r["mean_tokens"] == 20.0 and r["cut_share"] == 0.5
-    assert seen[0]["hooked"] is True and seen[0]["batch_size"] == 3 and seen[0]["max_new_tokens"] == 30
-    assert seen[0]["sampling"] == {"temperature": 0.7}
-    assert seen[0]["prompts"][0].startswith("<s>") and "Question 0?" in seen[0]["prompts"][0]
-    assert not decoder_layers(tiny_model)[LAYER]._forward_hooks  # hook removed
-
-    seen2 = []
-    monkeypatch.setattr(ev, "generate_counted", _fake_gen(["answer is C", "answer is B"], [5], seen2))
-    r = ev.free_generation(tiny_model, char_tok, None, refs, seed=7, max_new_tokens=30)
-    assert r["accuracy"] == 0.5 and r["accuracy_se"] == pytest.approx(math.sqrt(1 / 3) / 2)
-    assert seen2[0]["hooked"] is False and seen2[0]["rand"] == seen[0]["rand"]  # seeded the same
+# ---------------------------------------------------------------- generate (reference)
 
 
 def test_count_new_tokens():
@@ -239,13 +232,11 @@ def _cfg(tmp_path: Path, **kw) -> TrainConfig:
 KINDS = ("trained", "source_full", "source_train", "source_at_trained_norm", "trained_random", "source_random")
 
 
-def test_evaluate_tiny_every_kind_and_c(tiny_model, char_tok, tmp_path, monkeypatch, capsys):
-    seen = []
-    monkeypatch.setattr(ev, "generate_counted", _fake_gen(["the answer is C"], [8], seen))
+def test_evaluate_tiny_every_kind_and_c(tiny_model, char_tok, tmp_path, capsys):
     cfg = _cfg(tmp_path)
     td = _trait("t1", 1)
     trained = {"t1": 2.0 * td.source + 0.1}
-    res = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, trained, _refs(), free_gen_tokens=16)
+    res = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, trained, _refs())
 
     t = res["traits"]["t1"]
     assert set(t["kinds"]) == set(KINDS)
@@ -277,14 +268,9 @@ def test_evaluate_tiny_every_kind_and_c(tiny_model, char_tok, tmp_path, monkeypa
     assert t["cos_with_source"]["source_at_trained_norm"] == pytest.approx(1.0)
     assert t["cos_with_source"]["source_train"] == pytest.approx(1.0)
 
-    # free generation: unsteered once, then trained / source_full / trained_random at c = +-1
-    assert len(seen) == 7 and seen[0]["hooked"] is False and all(s["hooked"] for s in seen[1:])
-    assert all(s["max_new_tokens"] == 16 for s in seen)
-    assert seen[0]["sampling"] == {"temperature": 0.7, "top_p": 0.8, "top_k": 20}
-    fg = t["free_gen"]
-    assert fg["unsteered"]["accuracy"] == 1.0 and fg["unsteered"]["mean_tokens"] == 8.0
-    for k in ("trained", "source_full", "trained_random"):
-        assert set(fg[k]) == {"c=+1", "c=-1"}
+    # no free generation in evaluate: pending until `freegen` runs, its checks skipped
+    assert res["free_gen"] == {"enabled": True, "status": "pending"} and "free_gen" not in t
+    assert "accuracy@c=+1" in t["pass"]["skipped"] and "length@c=-1" in t["pass"]["skipped"]
     assert set(t["pass"]) >= {"checks", "failed", "passed", "skipped"}
     assert res["summary"] == {"t1": t["pass"]["passed"]}
     assert "joint" not in res
@@ -331,44 +317,27 @@ def test_evaluate_joint_cos_matrix_and_mixes(tiny_model, char_tok, tmp_path):
             assert isinstance(m["mix_margin"][s], float)
 
 
-def test_free_gen_seeds_paired_across_kinds(tiny_model, char_tok, tmp_path, monkeypatch):
-    seen = []
-    monkeypatch.setattr(ev, "generate_counted", _fake_gen(["the answer is C"], [8], seen))
+def test_evaluate_keeps_previous_free_gen_block(tiny_model, char_tok, tmp_path):
     cfg = _cfg(tmp_path)
     td = _trait("t1", 1)
-    ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(), free_gen_tokens=16)
-    # order: unsteered, then per kind (trained, source_full, trained_random) c = +1, c = -1
-    plus = [seen[i]["rand"] for i in (1, 3, 5)]
-    minus = [seen[i]["rand"] for i in (2, 4, 6)]
-    assert len(set(plus)) == 1 and len(set(minus)) == 1  # same seed per c for every kind
-    assert plus[0] != minus[0] and seen[0]["rand"] not in (plus[0], minus[0])
-
-
-def test_eval_json_written_before_free_generation(tiny_model, char_tok, tmp_path, monkeypatch):
-    path = tmp_path / "out" / "trained" / "run" / "eval.json"
-    snapshots = []
-    real = _fake_gen(["the answer is C"], [8], [])
-
-    def fake(*a, **kw):
-        if not snapshots:
-            snapshots.append(json.loads(path.read_text(encoding="utf-8")))
-        return real(*a, **kw)
-
-    monkeypatch.setattr(ev, "generate_counted", fake)
-    cfg = _cfg(tmp_path)
-    td = _trait("t1", 1)
-    res = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(), free_gen_tokens=16)
-    (early,) = snapshots
-    assert early["free_gen"]["status"] == "pending"
-    t = early["traits"]["t1"]
-    assert "free_gen" not in t and "length@c=+1" in t["pass"]["skipped"]
-    assert t["kinds"]["trained"]["c=+1"]["margins"] == res["traits"]["t1"]["kinds"]["trained"]["c=+1"]["margins"]
-    assert early["summary"] == {"t1": t["pass"]["passed"]}
-
-    final = json.loads(path.read_text(encoding="utf-8"))
-    assert final["free_gen"]["status"] == "done" and final["traits"]["t1"]["pass"]["skipped"] == []
-    assert "free_gen" in final["traits"]["t1"]
-    assert final["timing"]["teacher_forced_s"] >= 0 and final["timing"]["free_gen_s"] >= 0
+    first = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2))
+    blk = {"n": 2, "mean_tokens": 8.0, "cut_share": 0.0, "accuracy": 1.0, "accuracy_se": 0.0,
+           "qid": ["r0", "r1"], "tokens": [8, 8], "cut": [False, False], "answer": ["C", "C"], "correct": [1, 1]}
+    previous = json.loads(json.dumps(first))
+    previous["free_gen"] = {"enabled": True, "status": "done", "max_tokens": 15360, "unsteered": blk}
+    previous["timing"]["free_gen_s"] = 12.5
+    previous["traits"]["t1"]["free_gen"] = {"unsteered": blk, **{k: {"c=+1": blk, "c=-1": blk}
+                                                                 for k in ("trained", "source_full", "trained_random")}}
+    res = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2), previous=previous)
+    assert res["free_gen"] == previous["free_gen"] and res["timing"]["free_gen_s"] == 12.5
+    t = res["traits"]["t1"]
+    assert t["free_gen"] == previous["traits"]["t1"]["free_gen"]
+    assert t["pass"]["skipped"] == [] and "accuracy" in t["pass"]["checks"]["c=+1"]
+    assert t["kinds"]["trained"]["c=+1"]["margins"] == first["traits"]["t1"]["kinds"]["trained"]["c=+1"]["margins"]
+    # free_gen False: the previous block is dropped
+    res = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2), free_gen=False,
+                      previous=previous)
+    assert res["free_gen"]["status"] == "disabled" and "free_gen" not in res["traits"]["t1"]
 
 
 def test_eval_without_free_gen_status_disabled(tiny_model, char_tok, tmp_path):

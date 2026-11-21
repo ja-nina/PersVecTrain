@@ -1,4 +1,4 @@
-"""Batched HF sampling shared by `reference` (cli) and the free-generation check (evaluate)."""
+"""Batched HF sampling for `reference` (cli). The free-generation check runs on vLLM (freegen.py)."""
 from __future__ import annotations
 
 import torch

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,9 @@ import torch
 
 from persvectrain import cli
 from persvectrain import evaluate as ev
+from persvectrain import freegen as fgm
+from persvectrain import generate as gen_mod
+from persvectrain.data import supergpqa_prompts
 from tests.conftest import CharTokenizer, make_tiny_model
 
 MODEL = "qwen3.5-2b"
@@ -36,11 +40,18 @@ def _fake_trait(src: Path, slug: str, n: int = 24, drop: tuple[int, ...] = (3, 7
                                                  "negative_model": MODEL}), encoding="utf-8")
 
 
-def _fake_reference(out: Path, n: int = 20) -> Path:
+def _fake_reference(out: Path, n: int = 20, pool: Path | None = None) -> Path:
+    """n fake reference answers; with `pool`, also a pool file of n questions the reference is built from."""
     path = out / "trained" / "reference" / f"{MODEL}_pool260.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = [{"id": f"s{i}", "question": f"Question {i}?", "answer_text": "The answer is C.", "gold": "C"}
             for i in range(n)]
+    if pool is not None:
+        pool.write_text("".join(json.dumps({"id": f"s{i}", "question": f"Question {i}?",
+                                            "options": ["w", "x", "y", "z"], "answer": "C"}) + "\n"
+                                for i in range(n)), encoding="utf-8")
+        for r, it in zip(rows, supergpqa_prompts(pool)):
+            r["question"] = it["question"]
     path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     return path
 
@@ -54,12 +65,12 @@ def tiny(monkeypatch):
         return make_tiny_model(), CharTokenizer()
 
     def fake_generate(model, tok, prompts, batch_size, max_new_tokens, **kw):
-        calls.append(f"generate {max_new_tokens}")
+        calls.append(f"generate {max_new_tokens}")  # HF sampling: only `reference` may call it
         return ["so the answer is C"] * len(prompts), [7] * len(prompts)
 
     monkeypatch.setattr(cli, "load_model", fake_load)
     monkeypatch.setattr(cli, "N_HELD", 5)  # tiny fake reference: 15 train / 5 held
-    monkeypatch.setattr(ev, "generate_counted", fake_generate)
+    monkeypatch.setattr(gen_mod, "generate_counted", fake_generate)
     return calls
 
 
@@ -120,12 +131,14 @@ def test_cli_train_end_to_end_tiny(tiny, out_root, capsys):
     e = json.loads((root / "eval.json").read_text(encoding="utf-8"))
     t = e["traits"]["assertive"]
     assert len(t["kinds"]["trained"]["c=+1"]["margins"]) == 4 and len(t["kinds"]["trained"]["c=+1"]["kls"]) == 5
-    assert t["free_gen"]["unsteered"]["accuracy"] == 1.0 and t["free_gen"]["trained"]["c=-1"]["mean_tokens"] == 7
-    assert e["free_gen"]["max_new_tokens"] == 4096 and tiny.count("generate 4096") == 7
+    # no HF free generation in train: pending until `freegen` (vLLM)
+    assert e["free_gen"] == {"enabled": True, "status": "pending"} and "free_gen" not in t
+    assert not [c for c in tiny if c.startswith("generate")]
+    assert "accuracy@c=+1" in t["pass"]["skipped"]
     assert e["summary"] == {"assertive": t["pass"]["passed"]}
     assert t["norms"]["trained"] == pytest.approx(float(trained.float().norm()))
     out = capsys.readouterr().out
-    assert "evil" in out and "pass assertive:" in out
+    assert "evil" in out and "pass assertive:" in out and "free generation pending" in out
     assert "reference meta" in out and "missing" in out
 
 
@@ -134,13 +147,13 @@ def test_cli_train_no_free_gen_and_tokens(tiny, out_root):
     assert cli.main(_train_args(out_root, "--no-free-gen")) == 0
     e = json.loads((out_root / "trained" / "run1" / "eval.json").read_text(encoding="utf-8"))
     assert e["free_gen"]["enabled"] is False and not [c for c in tiny if c.startswith("generate")]
+    assert e["free_gen"]["status"] == "disabled"
     assert "length@c=+1" in e["traits"]["assertive"]["pass"]["skipped"]
 
-    args = _train_args(out_root, "--free-gen-tokens", "32")
+    args = _train_args(out_root, "--free-gen-tokens", "32")  # gone: freegen has --max-tokens
     args[args.index("run1")] = "run2"
-    assert cli.main(args) == 0
-    e = json.loads((out_root / "trained" / "run2" / "eval.json").read_text(encoding="utf-8"))
-    assert e["free_gen"]["max_new_tokens"] == 32 and "generate 32" in tiny
+    with pytest.raises(SystemExit):
+        cli.main(args)
 
 
 def test_cli_train_eval_crash_leaves_unfinished(tiny, out_root, monkeypatch):
@@ -183,7 +196,44 @@ def test_cli_eval_reruns_on_existing_run(tiny, out_root, monkeypatch):
     assert [p.index for p in td.train] == tj["splits"]["assertive"]["train"]
     assert [r.id for r in seen["kl_held"]] == tj["splits"]["reference"]["held"]
     assert seen["cfg"].layer == 1 and seen["cfg"].traits == ["assertive"]
-    assert seen["kw"] == {"free_gen": False, "free_gen_tokens": 4096}
+    assert seen["kw"] == {"free_gen": False, "previous": None}
+
+
+def test_cli_train_freegen_then_eval_keeps_free_gen(tiny, out_root, tmp_path, monkeypatch, capsys):
+    pool = tmp_path / "pool.jsonl"
+    _fake_reference(out_root, pool=pool)
+    assert cli.main(_train_args(out_root)) == 0
+    root = out_root / "trained" / "run1"
+    assert json.loads((root / "eval.json").read_text(encoding="utf-8"))["free_gen"]["status"] == "pending"
+
+    from persvecfast.engine import Result
+    requests = []
+
+    class Engine:
+        def generate(self, reqs):
+            requests.extend(reqs)
+            return [Result(r.key, "ANSWER: C", 9 if r.steer else 8, "stop") for r in reqs]
+
+    @contextmanager
+    def open_engine(spec, kind):
+        yield Engine()
+
+    monkeypatch.setattr(fgm, "load_tokenizer", lambda key: CharTokenizer())
+    monkeypatch.setattr(fgm, "default_open_engine", lambda: open_engine)
+    assert cli.main(["freegen", "--out", str(out_root), "--run-name", "run1", "--pool", str(pool),
+                     "--max-tokens", "64"]) == 0
+    assert len(requests) == 5 * (1 + 6) and all(r.max_tokens == 64 for r in requests)
+    assert tiny == [MODEL]  # freegen loads no HF model (only the training run did)
+    e = json.loads((root / "eval.json").read_text(encoding="utf-8"))
+    t = e["traits"]["assertive"]
+    assert e["free_gen"]["status"] == "done" and t["free_gen"]["trained"]["c=-1"]["accuracy"] == 1.0
+    assert t["pass"]["skipped"] == [] and "accuracy" in t["pass"]["checks"]["c=-1"]
+
+    # `eval` re-runs the teacher-forced part and keeps the free-gen block
+    assert cli.main(["eval", "--out", str(out_root), "--run-name", "run1"]) == 0
+    again = json.loads((root / "eval.json").read_text(encoding="utf-8"))
+    assert again["free_gen"] == e["free_gen"] and again["traits"]["assertive"]["free_gen"] == t["free_gen"]
+    assert again["traits"]["assertive"]["pass"]["skipped"] == []
 
 
 def test_cli_eval_missing_run(tiny, out_root):

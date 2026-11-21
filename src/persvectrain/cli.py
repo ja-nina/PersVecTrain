@@ -1,4 +1,4 @@
-"""Command line: `python -m persvectrain {check, reference, train, eval, report} ...`."""
+"""Command line: `python -m persvectrain {check, reference, train, eval, freegen, report} ...`."""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +10,6 @@ from dataclasses import MISSING, fields
 from pathlib import Path
 
 import torch
-from persvecfast.extract import vector_file
 from persvecfast.models import MODELS, request_seed
 from persvecfast.prompts import NEUTRAL_SYSTEM_PROMPT, chat_prompt
 from persvecfast.util import log, read_json, slugify, write_json
@@ -18,14 +17,17 @@ from persvecfast.util import log, read_json, slugify, write_json
 from persvectrain import data as data_mod
 from persvectrain.data import full_source_vector, load_pairs, start_vector, supergpqa_prompts, usable_traits
 from persvectrain.evaluate import evaluate
+from persvectrain.freegen import MAX_TOKENS as FREEGEN_MAX_TOKENS
+from persvectrain.freegen import POOL, REFERENCE_SUFFIX, run_freegen
 from persvectrain.generate import generate as _generate
-from persvectrain.output import (PERSVECFAST_REPO, REPO, build_train_json, git_commit, prepare_run, run_dir,
-                                 run_root, source_dir, write_vectors)
+from persvectrain.output import (PERSVECFAST_REPO, REPO, build_train_json, config_from_train_json, git_commit,
+                                 load_reference, load_trained, prepare_run, run_dir, run_root, source_dir,
+                                 write_vectors)
 from persvectrain.report import format_table, pick_run
 from persvectrain.steering import LOGPROB_NORMS, layer_type
 from persvectrain.train import RefAnswer, TrainConfig, TraitData, train
 
-REFERENCE_DATA = REPO / "data" / "supergpqa_pool.jsonl"
+REFERENCE_DATA = POOL
 REFERENCE_MAX_NEW_TOKENS = 512
 REFERENCE_POOL = "supergpqa 200-299 + 340-499"
 N_HELD = 100
@@ -41,7 +43,7 @@ def load_model(model_key: str):
 
 
 def reference_path(out: Path, model: str) -> Path:
-    return Path(out) / "trained" / "reference" / f"{model}_pool260.jsonl"
+    return Path(out) / "trained" / "reference" / f"{model}{REFERENCE_SUFFIX}"
 
 
 def reference_meta_path(out: Path, model: str) -> Path:
@@ -115,12 +117,6 @@ def cmd_reference(args) -> int:
     _write_jsonl_atomic(path, rows)
     log(f"reference: wrote {path}")
     return 0
-
-
-def load_reference(path: Path) -> list[RefAnswer]:
-    rows = [json.loads(l) for l in Path(path).read_text(encoding="utf-8").splitlines() if l.strip()]
-    return [RefAnswer(id=r["id"], question=r["question"], answer_text=r["answer_text"], gold=r["gold"])
-            for r in rows]
 
 
 def split_reference(refs: list[RefAnswer], seed: int,
@@ -213,36 +209,27 @@ def cmd_train(args) -> int:
         write_vectors(vec_dir, slug, cfg.layer, vectors[slug], src, cfg.run_name)
     # evaluate the vectors as saved (cast to the source dtype), as `eval` on this run would
     evaluate(model, tok, cfg, traits, load_trained(vec_dir, kept, cfg.layer), ref_held,
-             free_gen=not args.no_free_gen, free_gen_tokens=args.free_gen_tokens)
+             free_gen=not args.no_free_gen)
     meta.update(finished=True, ended=_now())
     write_json(root / "train.json", meta)
     log(f"train {cfg.run_name}: wrote {root}")
+    if not args.no_free_gen:
+        log(f"train {cfg.run_name}: free generation pending: run `python -m persvectrain freegen --out {cfg.out} "
+            f"--run-name {cfg.run_name}` (vLLM)")
     return 0
 
 
 # ---------------------------------------------------------------- eval
 
 
-def load_trained(vec_dir: Path, slugs: list[str], layer: int) -> dict[str, torch.Tensor]:
-    """The run's trained vectors from vllm_hook/{slug}_L{layer}.pt, as fp32."""
-    out = {}
-    for slug in slugs:
-        path = vector_file(vec_dir, slug, layer)
-        if not path.exists():
-            raise SystemExit(f"trained vector {path} missing: training did not finish writing {slug}")
-        out[slug] = torch.load(path)["dir"].float()
-    return out
-
-
 def cmd_eval(args) -> int:
-    """Re-run the evaluation of an existing run from its train.json (config + splits); writes eval.json only."""
+    """Re-run the teacher-forced evaluation of an existing run from its train.json (config + splits); writes
+    eval.json only, keeping an existing eval.json's free-gen block (dropped with --no-free-gen)."""
     root = run_root(Path(args.out), args.run_name)
     if not (root / "train.json").exists():
         raise SystemExit(f"no run at {root} (train.json missing)")
     meta = read_json(root / "train.json")
-    kw = dict(meta["config"])
-    kw["source"], kw["out"] = Path(kw["source"]), Path(args.out).resolve()
-    cfg = TrainConfig(**kw)
+    cfg = config_from_train_json(meta, args.out)
     src = source_dir(cfg)
     splits = meta["splits"]
 
@@ -261,15 +248,23 @@ def cmd_eval(args) -> int:
 
     model, tok = load_model(cfg.model)
     log(f"eval {cfg.run_name}: traits {cfg.traits}, layer {cfg.layer}")
-    evaluate(model, tok, cfg, traits, trained, ref_held, free_gen=not args.no_free_gen,
-             free_gen_tokens=args.free_gen_tokens)
+    previous = read_json(root / "eval.json") if (root / "eval.json").exists() and not args.no_free_gen else None
+    evaluate(model, tok, cfg, traits, trained, ref_held, free_gen=not args.no_free_gen, previous=previous)
     return 0
 
 
 def _add_eval_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-free-gen", action="store_true",
-                   help="skip free generation (the pass rule then skips its length checks)")
-    p.add_argument("--free-gen-tokens", type=int, default=4096, help="max new tokens per free answer")
+                   help="no free generation for this run (free_gen status disabled: `freegen` skips it and the "
+                        "pass rule skips its length and accuracy checks)")
+
+
+# ---------------------------------------------------------------- freegen
+
+
+def cmd_freegen(args) -> int:
+    res = run_freegen(Path(args.out), args.run_name, max_tokens=args.max_tokens, pool=Path(args.pool))
+    return 0 if res is not None else 1
 
 
 # ---------------------------------------------------------------- report
@@ -343,6 +338,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-name", required=True, dest="run_name")
     _add_eval_flags(p)
     p.set_defaults(func=cmd_eval)
+
+    p = sub.add_parser("freegen", help="free-generation check of a finished run on vLLM (fills eval.json's "
+                                       "free_gen block and recomputes the pass rule)")
+    p.add_argument("--out", required=True, help="out root holding trained/<run_name>")
+    p.add_argument("--run-name", required=True, dest="run_name")
+    p.add_argument("--max-tokens", type=int, default=FREEGEN_MAX_TOKENS, help="max new tokens per answer")
+    p.add_argument("--pool", default=str(POOL), help="the SuperGPQA pool file (option counts per question)")
+    p.set_defaults(func=cmd_freegen)
 
     p = sub.add_parser("report", help="pass/fail table over runs and the best run")
     p.add_argument("--out", required=True, help="out root holding trained/<run>/eval.json")
