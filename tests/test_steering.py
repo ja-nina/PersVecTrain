@@ -138,3 +138,30 @@ def test_layer_type(tiny_model):
         config = LlamaConfig(layer_types=["linear_attention", "full_attention", "linear_attention"])
 
     assert layer_type(M(), 0) == "linear_attention"
+
+
+def test_answer_logprob_mean_is_sum_over_answer_tokens(tiny_model, char_tok):
+    ids, start = _ids(char_tok)
+    n = ids.shape[1] - start
+    with torch.no_grad():
+        total = answer_logprob(tiny_model, ids, start)
+        mean = answer_logprob(tiny_model, ids, start, norm="mean")
+        assert torch.equal(answer_logprob(tiny_model, ids, start, norm="sum"), total)
+    assert n == len(A) and float(mean) == pytest.approx(float(total) / n, rel=1e-6)
+    with pytest.raises(ValueError):
+        answer_logprob(tiny_model, ids, start, norm="max")
+
+
+def test_answer_logprobs_forward_without_cache(tiny_model, char_tok, monkeypatch):
+    seen = []
+    real = type(tiny_model).forward
+
+    def spy(self, *a, **kw):
+        seen.append(kw.get("use_cache"))
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(type(tiny_model), "forward", spy)
+    ids, start = _ids(char_tok)
+    with torch.no_grad():
+        answer_logprobs(tiny_model, ids, start)
+    assert seen == [False]

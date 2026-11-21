@@ -52,12 +52,19 @@ def answer_logprobs(model, ids: torch.Tensor, start: int) -> torch.Tensor:
     """fp32 log-softmax [T_answer, vocab] of the positions that predict ids[0, start:]."""
     assert ids.shape[0] == 1, "batch of one expected"
     T = ids.shape[1]
-    logits = model(ids.to(model.device), logits_to_keep=T - start + 1).logits[0, :-1]
+    # use_cache=False: one full pass per call, no KV cache kept alive (training / eval, never generate)
+    logits = model(ids.to(model.device), logits_to_keep=T - start + 1, use_cache=False).logits[0, :-1]
     return torch.log_softmax(logits.float(), dim=-1)
 
 
-def answer_logprob(model, ids: torch.Tensor, start: int) -> torch.Tensor:
-    """Scalar: summed log p of the answer tokens."""
+LOGPROB_NORMS = ("sum", "mean")
+
+
+def answer_logprob(model, ids: torch.Tensor, start: int, norm: str = "sum") -> torch.Tensor:
+    """Scalar: summed log p of the answer tokens ("sum", BiPO's default) or that sum / answer tokens ("mean")."""
+    if norm not in LOGPROB_NORMS:
+        raise ValueError(f"unknown logprob norm {norm!r}")
     lp = answer_logprobs(model, ids, start)
     tgt = ids[0, start:].to(lp.device)
-    return lp.gather(1, tgt[:, None]).sum()
+    total = lp.gather(1, tgt[:, None]).sum()
+    return total / tgt.shape[0] if norm == "mean" else total

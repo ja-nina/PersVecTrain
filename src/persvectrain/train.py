@@ -10,13 +10,14 @@ from pathlib import Path
 from typing import Callable
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 from persvecfast.models import request_seed
 from transformers import get_cosine_schedule_with_warmup
 
 from persvectrain.data import Pair
-from persvectrain.losses import kl_loss, overlap_loss, persona_loss
-from persvectrain.steering import answer_logprob, answer_logprobs, encode, steer
+from persvectrain.losses import kl_loss, overlap_loss, persona_loss, persona_margin
+from persvectrain.steering import LOGPROB_NORMS, answer_logprob, answer_logprobs, encode, steer
 
 
 @dataclass
@@ -41,6 +42,8 @@ class TrainConfig:
     init: str = "dom"  # "dom" | "zero"
     mix_every: int = 2
     seed: int = 0
+    logprob_norm: str = "sum"  # "sum" (BiPO) | "mean": each answer's summed log-prob / its answer tokens
+    min_pairs: int = 20  # traits with fewer kept pairs are dropped (as `check`)
 
 
 @dataclass
@@ -67,6 +70,8 @@ def train(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], kl_train: 
         raise ValueError(f"unknown init {cfg.init!r}")
     if cfg.mode not in ("solo", "joint"):
         raise ValueError(f"unknown mode {cfg.mode!r}")
+    if cfg.logprob_norm not in LOGPROB_NORMS:
+        raise ValueError(f"unknown logprob_norm {cfg.logprob_norm!r}")
     if cfg.lambda_kl != 0:
         if not kl_train:
             raise ValueError("lambda_kl != 0 needs kl_train reference answers")
@@ -97,10 +102,47 @@ def _encode_pairs(tok, pairs: list[Pair], max_tok: int) -> list[tuple]:
 
 
 @torch.no_grad()
-def _unsteered_pair_logprobs(model, enc: list[tuple]) -> list[tuple[Tensor, Tensor]]:
-    """Summed unsteered answer log-probs (pos, neg) per encoded pair, computed once and reused."""
-    return [(answer_logprob(model, ip, sp).detach(), answer_logprob(model, in_, sn).detach())
+def _unsteered_pair_logprobs(model, enc: list[tuple], norm: str = "sum") -> list[tuple[Tensor, Tensor]]:
+    """Unsteered answer log-probs (pos, neg) per encoded pair (`norm` as answer_logprob), computed once."""
+    return [(answer_logprob(model, ip, sp, norm).detach(), answer_logprob(model, in_, sn, norm).detach())
             for ip, sp, in_, sn in enc]
+
+
+def _cos_start(v: Tensor, start: Tensor | None) -> float | None:
+    """Cosine of v with its start vector; None without one (zero init) or while v is zero."""
+    if start is None:
+        return None
+    v = v.detach().float()
+    if float(v.norm()) == 0.0:
+        return None
+    return float(F.cosine_similarity(v, start.to(v.device).float(), dim=0))
+
+
+def _start_of(cfg: TrainConfig, td: TraitData) -> Tensor | None:
+    return td.start.detach().float() if cfg.init == "dom" else None
+
+
+@torch.no_grad()
+def _start_entry(model, cfg: TrainConfig, step: int, vecs: dict[str, Tensor], enc: dict[str, list[tuple]],
+                 lp0: dict[str, list[tuple]]) -> dict:
+    """The "start" log line: per trait, the mean train persona margin of the starting vector at c = +1 / -1
+    and beta * margin (the BiPO sigmoid saturates once beta * margin is large: ~5 gives a gradient of ~0.007)."""
+    traits = {}
+    for slug, v in vecs.items():
+        row = {"norm": float(v.detach().norm())}
+        for sign, key in ((1, "pos"), (-1, "neg")):
+            ms = []
+            for (ids_p, s_p, ids_n, s_n), ref in zip(enc[slug], lp0[slug]):
+                with steer(model, cfg.layer, sign * v.detach()):
+                    lpc_p = answer_logprob(model, ids_p, s_p, cfg.logprob_norm)
+                    lpc_n = answer_logprob(model, ids_n, s_n, cfg.logprob_norm)
+                ms.append(float(persona_margin(lpc_p, ref[0], lpc_n, ref[1], sign)))
+            m = sum(ms) / len(ms)
+            row[f"margin_{key}"] = m
+            row[f"beta_margin_{key}"] = cfg.beta * m
+        traits[slug] = row
+    return {"step": step, "kind": "start", "trait": "+".join(vecs), "init": cfg.init, "beta": cfg.beta,
+            "logprob_norm": cfg.logprob_norm, "traits": traits}
 
 
 def _optimizer(cfg: TrainConfig, params: list[nn.Parameter], total: int):
@@ -119,22 +161,19 @@ def _epoch_batches(n: int, batch: int, gen: torch.Generator) -> list[list[int]]:
     return [order[i:i + batch] for i in range(0, n, batch)]
 
 
-def _persona_backward(model, layer: int, v: Tensor, sign: int, enc: tuple, lp0: tuple[Tensor, Tensor],
-                      beta: float, scale: float) -> float:
-    """Steered pass on one pair under sign * v (pos + neg, one backward); returns the unscaled persona loss."""
-    return _persona_term(model, layer, sign * v, sign, enc, lp0, beta, scale)
+def _persona_term(model, cfg: TrainConfig, vec: Tensor, sign: int, enc: tuple, ref: tuple[Tensor, Tensor],
+                  scale: float) -> tuple[float, float]:
+    """Persona loss of one pair (pos + neg, one backward) steered by `vec` against reference log-probs `ref`.
 
-
-def _persona_term(model, layer: int, vec: Tensor, sign: int, enc: tuple, ref: tuple[Tensor, Tensor],
-                  beta: float, scale: float) -> float:
-    """Persona loss of one pair steered by `vec` against reference log-probs `ref`; backward, unscaled loss."""
+    Returns the unscaled (loss, margin)."""
     ids_p, s_p, ids_n, s_n = enc
-    with steer(model, layer, vec):
-        lpc_p = answer_logprob(model, ids_p, s_p)
-        lpc_n = answer_logprob(model, ids_n, s_n)
-    loss = persona_loss(lpc_p, ref[0], lpc_n, ref[1], sign, beta)
+    with steer(model, cfg.layer, vec):
+        lpc_p = answer_logprob(model, ids_p, s_p, cfg.logprob_norm)
+        lpc_n = answer_logprob(model, ids_n, s_n, cfg.logprob_norm)
+    margin = persona_margin(lpc_p, ref[0], lpc_n, ref[1], sign)
+    loss = persona_loss(lpc_p, ref[0], lpc_n, ref[1], sign, cfg.beta)
     (loss * scale).backward()
-    return float(loss.detach())
+    return float(loss.detach()), float(margin.detach())
 
 
 def _kl_backward(model, layer: int, v: Tensor, sign: int, enc: tuple, scale: float) -> float:
@@ -168,19 +207,23 @@ def _kl_terms(model, cfg: TrainConfig, vec: Tensor, sign: int, kl_enc: list[tupl
 
 
 def _single_terms(model, cfg: TrainConfig, v: Tensor, sign: int, idx: list[int], enc: list[tuple],
-                  lp0: list[tuple], kl_enc: list[tuple], kl_cursor: int) -> tuple[float, float, int]:
+                  lp0: list[tuple], kl_enc: list[tuple], kl_cursor: int) -> tuple[float, float, float, int]:
     """One trait's step terms (backward only): L = mean persona over idx + lambda_kl * mean KL.
 
-    Each sequence backpropagates its share of L separately. Returns (mean persona, mean KL, new KL cursor).
+    Each sequence backpropagates its share of L separately.
+    Returns (mean persona loss, mean persona margin, mean KL, new KL cursor).
     """
     p_scale = 1.0 / len(idx)
     lp_sum = 0.0
+    m_sum = 0.0
     for i in idx:
-        lp_sum += _persona_backward(model, cfg.layer, v, sign, enc[i], lp0[i], cfg.beta, p_scale)
+        loss, margin = _persona_term(model, cfg, sign * v, sign, enc[i], lp0[i], p_scale)
+        lp_sum += loss
+        m_sum += margin
     if cfg.lambda_kl == 0:
-        return lp_sum / len(idx), 0.0, kl_cursor
+        return lp_sum / len(idx), m_sum / len(idx), 0.0, kl_cursor
     kl_sum, kl_cursor = _kl_terms(model, cfg, v, sign, kl_enc, kl_cursor)
-    return lp_sum / len(idx), kl_sum / cfg.kl_batch, kl_cursor
+    return lp_sum / len(idx), m_sum / len(idx), kl_sum / cfg.kl_batch, kl_cursor
 
 
 def _encode_kl(tok, cfg: TrainConfig, kl_train: list[RefAnswer]) -> list[tuple]:
@@ -198,9 +241,11 @@ def _train_solo(model, tok, cfg, traits, kl_train, log_step) -> dict[str, Tensor
     for slug in cfg.traits:
         td = traits[slug]
         enc = _encode_pairs(tok, td.train, cfg.max_answer_tokens)
-        lp0 = _unsteered_pair_logprobs(model, enc)
+        lp0 = _unsteered_pair_logprobs(model, enc, cfg.logprob_norm)
 
         v = _init_vector(cfg, td, device)
+        start = _start_of(cfg, td)
+        log_step(_start_entry(model, cfg, step, {slug: v}, {slug: enc}, {slug: lp0}))
         per_epoch = math.ceil(len(td.train) / cfg.batch)
         total = cfg.epochs * per_epoch
         opt, sched = _optimizer(cfg, [v], total)
@@ -212,21 +257,25 @@ def _train_solo(model, tok, cfg, traits, kl_train, log_step) -> dict[str, Tensor
             for idx in _epoch_batches(len(td.train), cfg.batch, order_gen):
                 sign = _draw_sign(sign_gen)
                 norm = float(v.detach().norm())
+                cos = _cos_start(v, start)
                 lr = float(sched.get_last_lr()[0])
                 opt.zero_grad(set_to_none=True)
-                loss_p, loss_kl, kl_cursor = _single_terms(model, cfg, v, sign, idx, enc, lp0, kl_enc, kl_cursor)
+                loss_p, margin, loss_kl, kl_cursor = _single_terms(model, cfg, v, sign, idx, enc, lp0, kl_enc,
+                                                                   kl_cursor)
                 opt.step()
                 sched.step()
-                log_step(_single_log(step, slug, sign, loss_p, loss_kl, 0.0, norm, lr))
+                log_step(_single_log(step, slug, sign, loss_p, margin, loss_kl, 0.0, norm, cos, lr))
                 step += 1
         out[slug] = v.detach().float().cpu().clone()
     return out
 
 
-def _single_log(step: int, slug: str, sign: int, loss_p: float, loss_kl: float, loss_o: float, norm: float,
-                lr: float) -> dict:
+def _single_log(step: int, slug: str, sign: int, loss_p: float, margin: float, loss_kl: float, loss_o: float,
+                norm: float, cos_start: float | None, lr: float) -> dict:
+    """`norm` and `cos_start` are v's before the step; `margin` is the step's mean persona margin."""
     return {"step": step, "kind": "single", "trait": slug, "sign": sign, "weights": {slug: sign},
-            "loss_p": loss_p, "loss_kl": loss_kl, "loss_o": loss_o, "norm": norm, "lr": lr}
+            "loss_p": loss_p, "margin": margin, "loss_kl": loss_kl, "loss_o": loss_o, "norm": norm,
+            "cos_start": cos_start, "lr": lr}
 
 
 # ---------------------------------------------------------------- joint
@@ -263,8 +312,10 @@ def _train_joint(model, tok, cfg, traits, kl_train, log_step) -> dict[str, Tenso
     kl_enc = _encode_kl(tok, cfg, kl_train)
 
     enc = {s: _encode_pairs(tok, traits[s].train, cfg.max_answer_tokens) for s in slugs}
-    lp0 = {s: _unsteered_pair_logprobs(model, enc[s]) for s in slugs}
+    lp0 = {s: _unsteered_pair_logprobs(model, enc[s], cfg.logprob_norm) for s in slugs}
     vs = {s: _init_vector(cfg, traits[s], device) for s in slugs}
+    starts = {s: _start_of(cfg, traits[s]) for s in slugs}
+    log_step(_start_entry(model, cfg, 0, vs, enc, lp0))
     all_vs = [vs[s] for s in slugs]
     sign_gen = {s: _generator(cfg, s, "sign") for s in slugs}
     order_gen = {s: _generator(cfg, s, "shuffle") for s in slugs}
@@ -285,7 +336,8 @@ def _train_joint(model, tok, cfg, traits, kl_train, log_step) -> dict[str, Tenso
         lr = float(sched.get_last_lr()[0])
         opt.zero_grad(set_to_none=True)
         if _is_mix(step, cfg.mix_every):
-            entry, kl_cursor = _mix_step(model, cfg, slugs, traits, vs, enc, kl_enc, kl_cursor, mix_gen)
+            entry, kl_cursor = _mix_step(model, cfg, slugs, traits, vs, starts, enc, kl_enc, kl_cursor,
+                                         mix_gen)
             loss_o = _overlap_term(cfg, all_vs)
             entry = {"step": step, **entry, "loss_o": loss_o, "lr": lr}
         else:
@@ -294,10 +346,11 @@ def _train_joint(model, tok, cfg, traits, kl_train, log_step) -> dict[str, Tenso
             v = vs[slug]
             sign = _draw_sign(sign_gen[slug])
             norm = float(v.detach().norm())
-            loss_p, loss_kl, kl_cursor = _single_terms(model, cfg, v, sign, idx, enc[slug], lp0[slug], kl_enc,
-                                                       kl_cursor)
+            cos = _cos_start(v, starts[slug])
+            loss_p, margin, loss_kl, kl_cursor = _single_terms(model, cfg, v, sign, idx, enc[slug], lp0[slug],
+                                                               kl_enc, kl_cursor)
             loss_o = _overlap_term(cfg, all_vs)
-            entry = _single_log(step, slug, sign, loss_p, loss_kl, loss_o, norm, lr)
+            entry = _single_log(step, slug, sign, loss_p, margin, loss_kl, loss_o, norm, cos, lr)
         opt.step()
         sched.step()
         log_step(entry)
@@ -305,8 +358,8 @@ def _train_joint(model, tok, cfg, traits, kl_train, log_step) -> dict[str, Tenso
 
 
 def _mix_step(model, cfg: TrainConfig, slugs: list[str], traits: dict[str, TraitData],
-              vs: dict[str, nn.Parameter], enc: dict[str, list[tuple]], kl_enc: list[tuple], kl_cursor: int,
-              gen: torch.Generator) -> tuple[dict, int]:
+              vs: dict[str, nn.Parameter], starts: dict[str, Tensor | None], enc: dict[str, list[tuple]],
+              kl_enc: list[tuple], kl_cursor: int, gen: torch.Generator) -> tuple[dict, int]:
     """Backward of one 2-trait mix step; returns (partial log entry, new KL cursor).
 
     Steered by w_A v_A + w_B v_B. Trait i's persona term uses its own sampled pairs, sign(w_i), the other
@@ -321,10 +374,12 @@ def _mix_step(model, cfg: TrainConfig, slugs: list[str], traits: dict[str, Trait
         weights[s] = mag * _draw_sign(gen)
     idx = {s: torch.randperm(len(traits[s].train), generator=gen)[:cfg.batch].tolist() for s in mix}
     norms = {s: float(vs[s].detach().norm()) for s in mix}
+    cos_starts = {s: _cos_start(vs[s], starts[s]) for s in mix}
     n_pairs = sum(len(i) for i in idx.values())
     p_scale = 1.0 / n_pairs
 
     lp_sum = 0.0
+    m_sum = 0.0
     for s in mix:
         (other,) = [o for o in mix if o != s]
         other_vec = (weights[other] * vs[other]).detach()
@@ -334,10 +389,13 @@ def _mix_step(model, cfg: TrainConfig, slugs: list[str], traits: dict[str, Trait
             for i in idx[s]:
                 ids_p, s_p, ids_n, s_n = enc[s][i]
                 with steer(model, cfg.layer, other_vec):
-                    refs.append((answer_logprob(model, ids_p, s_p), answer_logprob(model, ids_n, s_n)))
+                    refs.append((answer_logprob(model, ids_p, s_p, cfg.logprob_norm),
+                                 answer_logprob(model, ids_n, s_n, cfg.logprob_norm)))
         for i, ref in zip(idx[s], refs):
             vec = weights[s] * vs[s] + other_vec
-            lp_sum += _persona_term(model, cfg.layer, vec, sign, enc[s][i], ref, cfg.beta, p_scale)
+            loss, margin = _persona_term(model, cfg, vec, sign, enc[s][i], ref, p_scale)
+            lp_sum += loss
+            m_sum += margin
 
     loss_kl = 0.0
     if cfg.lambda_kl != 0:
@@ -349,5 +407,6 @@ def _mix_step(model, cfg: TrainConfig, slugs: list[str], traits: dict[str, Trait
             kl_cursor += 1
         loss_kl = kl_sum / cfg.kl_batch
     entry = {"kind": "mix", "trait": "+".join(mix), "sign": 0, "weights": weights, "loss_p": lp_sum / n_pairs,
-             "loss_kl": loss_kl, "norm": norms[mix[0]], "norms": norms}
+             "margin": m_sum / n_pairs, "loss_kl": loss_kl, "norm": norms[mix[0]], "norms": norms,
+             "cos_start": cos_starts[mix[0]], "cos_starts": cos_starts}
     return entry, kl_cursor
