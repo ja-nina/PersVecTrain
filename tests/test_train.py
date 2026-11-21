@@ -142,9 +142,6 @@ def test_same_seed_same_vectors(tiny_model, char_tok):
     assert not torch.equal(a, c)
 
 
-def test_joint_not_implemented(tiny_model, char_tok):
-    with pytest.raises(NotImplementedError):
-        train(tiny_model, char_tok, _cfg(mode="joint"), {"t1": _trait("t1")}, _refs(), lambda d: None)
 
 
 @pytest.mark.parametrize("lambda_kl", [0.0, 3.0])
@@ -201,3 +198,159 @@ def test_trait_order_does_not_change_vectors(tiny_model, char_tok):
     ab = train(tiny_model, char_tok, _cfg(traits=["A", "B"], lambda_kl=1.0, epochs=1), traits, _refs(), lambda d: None)
     ba = train(tiny_model, char_tok, _cfg(traits=["B", "A"], lambda_kl=1.0, epochs=1), traits, _refs(), lambda d: None)
     assert torch.equal(ab["A"], ba["A"]) and torch.equal(ab["B"], ba["B"])
+
+
+# ---------------------------------------------------------------- joint
+
+
+def _cos(a, b) -> float:
+    return float(torch.nn.functional.cosine_similarity(a, b, dim=0))
+
+
+def test_solo_logs_single_kind(tiny_model, char_tok):
+    logs: list[dict] = []
+    train(tiny_model, char_tok, _cfg(epochs=1), {"t1": _trait("t1")}, _refs(), logs.append)
+    for d in logs:
+        assert d["kind"] == "single" and d["weights"] == {"t1": d["sign"]} and d["loss_o"] == 0.0
+
+
+def test_kl_batch_must_be_positive_when_kl_on(tiny_model, char_tok):
+    with pytest.raises(ValueError):
+        train(tiny_model, char_tok, _cfg(lambda_kl=1.0, kl_batch=0), {"t1": _trait("t1")}, _refs(), lambda d: None)
+    # KL off: kl_batch is unused
+    train(tiny_model, char_tok, _cfg(lambda_kl=0.0, kl_batch=0, epochs=1), {"t1": _trait("t1")}, _refs(),
+          lambda d: None)
+
+
+def test_solo_equals_joint_without_extras(tiny_model, char_tok):
+    td = _trait("t1", n_train=5)
+    solo_logs: list[dict] = []
+    joint_logs: list[dict] = []
+    solo = train(tiny_model, char_tok, _cfg(lambda_kl=1.0, epochs=2), {"t1": td}, _refs(), solo_logs.append)
+    joint = train(tiny_model, char_tok, _cfg(mode="joint", lambda_kl=1.0, epochs=2, lambda_o=0.0, mix_every=0),
+                  {"t1": td}, _refs(), joint_logs.append)
+    assert torch.equal(solo["t1"], joint["t1"])
+    assert solo_logs == joint_logs
+
+
+def test_joint_overlap_reduces_cosine(tiny_model, char_tok):
+    g = torch.Generator().manual_seed(3)
+    a = 0.3 * torch.randn(16, generator=g)
+    noise = torch.randn(16, generator=g)
+    noise = noise - (noise @ a) / (a @ a) * a
+    b = 0.9 * a / a.norm() + math.sqrt(1 - 0.81) * noise / noise.norm()
+    b = b * a.norm()
+    assert _cos(a, b) == pytest.approx(0.9, abs=1e-5)
+    traits = {"A": TraitData("A", _pairs(4), _pairs(2, 100), a, a.clone()),
+              "B": TraitData("B", _pairs(4), _pairs(2, 100), b, b.clone())}
+    logs: list[dict] = []
+    out = train(tiny_model, char_tok, _cfg(mode="joint", traits=["A", "B"], lambda_o=10.0, lambda_kl=0.0,
+                                           mix_every=0, epochs=3), traits, _refs(), logs.append)
+    assert abs(_cos(out["A"], out["B"])) < 0.9
+    assert logs[0]["loss_o"] == pytest.approx(0.81, rel=1e-4)
+
+
+def test_joint_round_robin_and_mix_schedule(tiny_model, char_tok):
+    traits = {"A": _trait("A", n_train=4, seed=1), "B": _trait("B", n_train=2, seed=2)}
+    logs: list[dict] = []
+    train(tiny_model, char_tok, _cfg(mode="joint", traits=["A", "B"], mix_every=3, epochs=1, batch=2),
+          traits, _refs(), logs.append)
+    # singles per epoch: A, B, A (round robin); mix at s % 3 == 2; ends when singles are used up
+    assert [d["kind"] for d in logs] == ["single", "single", "mix", "single"]
+    assert [d["trait"] for d in logs if d["kind"] == "single"] == ["A", "B", "A"]
+    assert [d["step"] for d in logs] == [0, 1, 2, 3]
+
+
+def test_mix_weights_bounded(tiny_model, char_tok):
+    traits = {s: _trait(s, n_train=4, seed=i + 1) for i, s in enumerate(["A", "B", "C"])}
+    logs: list[dict] = []
+    train(tiny_model, char_tok, _cfg(mode="joint", traits=["A", "B", "C"], mix_every=2, epochs=2, lambda_o=1.0),
+          traits, _refs(), logs.append)
+    mixes = [d for d in logs if d["kind"] == "mix"]
+    assert mixes
+    for d in mixes:
+        assert len(d["weights"]) == 2 and d["sign"] == 0
+        assert d["trait"] == "+".join(d["weights"])
+        assert set(d["norms"]) == set(d["weights"])
+        for w in d["weights"].values():
+            assert isinstance(w, float) and 0.25 <= abs(w) <= 1.0
+        assert d["norm"] == d["norms"][next(iter(d["weights"]))]
+    for d in logs:
+        assert d["loss_o"] > 0.0
+
+
+def test_mix_step_reference_is_other_traits(tiny_model, char_tok, monkeypatch):
+    from persvectrain import train as train_mod
+
+    real_steer = train_mod.steer
+    calls: list[tuple] = []
+
+    def recording_steer(model, layer, vec):
+        calls.append((None if vec is None else vec.detach().clone(), torch.is_grad_enabled()))
+        return real_steer(model, layer, vec)
+
+    monkeypatch.setattr(train_mod, "steer", recording_steer)
+    traits = {"A": _trait("A", n_train=2, seed=1), "B": _trait("B", n_train=2, seed=2)}
+    logs: list[dict] = []
+    # one single batch per trait, all steps mix: 2 steps; inspect the first
+    train(tiny_model, char_tok, _cfg(mode="joint", traits=["A", "B"], mix_every=1, epochs=1, batch=2,
+                                     lambda_kl=1.0, kl_batch=2), traits, _refs(), logs.append)
+    assert logs[0]["kind"] == "mix"
+    (sa, wa), (sb, wb) = logs[0]["weights"].items()
+    va, vb = traits[sa].start, traits[sb].start
+    mix = wa * va + wb * vb
+    first = calls[:2 * 2 + 2 * 2 + 2]  # A: 2 refs + 2 steered, B: 2 refs + 2 steered, 2 KL
+    exp = ([(wb * vb, False)] * 2 + [(mix, True)] * 2 + [(wa * va, False)] * 2 + [(mix, True)] * 2
+           + [(mix, True)] * 2)
+    assert len(first) == len(exp)
+    for (vec, grad_on), (want, want_grad) in zip(first, exp):
+        assert grad_on == want_grad
+        assert torch.allclose(vec, want, atol=1e-6)
+
+
+def test_mix_step_gradient(tiny_model, char_tok, monkeypatch):
+    """Mix-step gradient = grad of mean persona over both traits' pairs (other vector detached, reference under
+    the other trait's term) + lambda_kl * mean KL under the full mix (gradient to both)."""
+    from persvectrain import train as train_mod
+    from persvectrain.losses import persona_loss
+
+    grads = []
+    real_step = torch.optim.AdamW.step
+
+    def recording_step(self, *a, **kw):
+        grads.append([p.grad.detach().clone() for p in self.param_groups[0]["params"]])
+        return real_step(self, *a, **kw)
+
+    monkeypatch.setattr(train_mod.torch.optim.AdamW, "step", recording_step)
+    traits = {"A": _trait("A", n_train=2, seed=1), "B": _trait("B", n_train=2, seed=2)}
+    refs = _refs(3)
+    logs: list[dict] = []
+    train(tiny_model, char_tok, _cfg(mode="joint", traits=["A", "B"], mix_every=1, epochs=1, batch=2,
+                                     lambda_kl=2.0, kl_batch=2), traits, refs, logs.append)
+    w = logs[0]["weights"]
+    v = {s: traits[s].start.clone().requires_grad_(True) for s in ("A", "B")}
+    p_losses = []
+    for s in w:
+        (o,) = [x for x in w if x != s]
+        other = (w[o] * v[o]).detach()
+        sign = 1 if w[s] > 0 else -1
+        for p in traits[s].train:  # batch == n_train: every pair is sampled
+            ids_p, s_p = encode(char_tok, p.question, p.pos, MAX_TOK)
+            ids_n, s_n = encode(char_tok, p.question, p.neg, MAX_TOK)
+            with torch.no_grad(), steer(tiny_model, LAYER, other):
+                r_p, r_n = answer_logprob(tiny_model, ids_p, s_p), answer_logprob(tiny_model, ids_n, s_n)
+            with steer(tiny_model, LAYER, w[s] * v[s] + other):
+                c_p, c_n = answer_logprob(tiny_model, ids_p, s_p), answer_logprob(tiny_model, ids_n, s_n)
+            p_losses.append(persona_loss(c_p, r_p, c_n, r_n, sign, 0.1))
+    kls = []
+    for r in refs[:2]:
+        ids, st = encode(char_tok, r.question, r.answer_text, MAX_TOK)
+        with torch.no_grad():
+            lp0 = answer_logprobs(tiny_model, ids, st)
+        with steer(tiny_model, LAYER, w["A"] * v["A"] + w["B"] * v["B"]):
+            kls.append(kl_loss(lp0, answer_logprobs(tiny_model, ids, st)))
+    total = torch.stack(p_losses).mean() + 2.0 * torch.stack(kls).mean()
+    ga, gb = torch.autograd.grad(total, [v["A"], v["B"]])
+    assert torch.allclose(grads[0][0], ga, rtol=1e-4, atol=1e-7)
+    assert torch.allclose(grads[0][1], gb, rtol=1e-4, atol=1e-7)
+    assert logs[0]["loss_p"] == pytest.approx(float(torch.stack(p_losses).mean().detach()), rel=1e-5)
