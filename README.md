@@ -14,8 +14,8 @@ PersVecFast (extracted responses and activations) and imports its `persvecfast` 
 
 - `check` - validate the PersVecFast inputs: kept pairs per trait, dropped traits, and each trait's `model` /
   `extraction_model` / `negative_model` from its `{slug}.json`
-- `reference` - unsteered SuperGPQA 200-299 answers of the model (the KL term's reference), written as
-  `<out>/trained/reference/<model>.jsonl` with its sampling settings and commits in `<model>.meta.json`
+- `reference` - unsteered answers of the model to the 260-question SuperGPQA pool (records 200-299 + 340-499, `data/supergpqa_pool.jsonl`; 160 KL-train, 100 held-out), the KL term's reference, written as
+  `<out>/trained/reference/<model>_pool260.jsonl` with its sampling settings and commits in `<model>_pool260.meta.json`
 - `train` - train vectors (`--mode solo` or `joint`) and write `train.json`, `steps.jsonl`, the vectors and
   `eval.json`
 - `eval` - re-run the evaluation of an existing run

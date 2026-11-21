@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import torch
 
 from persvectrain.data import (
@@ -15,7 +16,8 @@ from persvectrain.data import (
     Pair,
 )
 
-REAL = Path(__file__).resolve().parent.parent / "data" / "supergpqa_200_299.jsonl"
+REAL = Path(__file__).resolve().parent.parent / "data" / "supergpqa_pool.jsonl"
+MA_SOURCE = Path(__file__).resolve().parents[2] / "MA_Environments" / "testbed" / "data" / "supergpqa.jsonl"
 
 
 def _responses(tmp_path, slug, kept_flags):
@@ -80,7 +82,7 @@ def test_supergpqa_format(tmp_path):
     assert out[0]["id"] == "a" and out[0]["answer"] == "B"
     assert out[0]["question"] == "Q?\n\nA. x\nB. y\n\nWhich option is correct?"
     assert set(out[0]) == {"id", "question", "answer"}
-    assert len(supergpqa_prompts(REAL)) == 100
+    assert len(supergpqa_prompts(REAL)) == 260
 
 
 def test_usable_traits_drops_with_reason(tmp_path):
@@ -89,3 +91,19 @@ def test_usable_traits_drops_with_reason(tmp_path):
     kept, reasons = usable_traits(tmp_path, ["first", "second", "third"])
     assert kept == ["first"]
     assert reasons == {"second": "5 kept pairs < 20", "third": "missing"}
+
+
+def test_pool_has_260_unique_records():
+    rows = [json.loads(l) for l in REAL.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(rows) == 260 and len({r["id"] for r in rows}) == 260
+
+
+def test_pool_matches_ma_source_records():
+    if not MA_SOURCE.exists():
+        pytest.skip("MA_Environments checkout not next to this repo")
+    src = MA_SOURCE.read_text(encoding="utf-8").splitlines()
+    want = src[200:300] + src[340:500]
+    got = REAL.read_text(encoding="utf-8").splitlines()
+    assert got == want
+    ids = lambda ls: {json.loads(l)["id"] for l in ls}
+    assert not ids(got) & ids(src[0:200] + src[300:340])

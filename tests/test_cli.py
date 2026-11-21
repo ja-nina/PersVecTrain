@@ -36,8 +36,8 @@ def _fake_trait(src: Path, slug: str, n: int = 24, drop: tuple[int, ...] = (3, 7
                                                  "negative_model": MODEL}), encoding="utf-8")
 
 
-def _fake_reference(out: Path, n: int = 10) -> Path:
-    path = out / "trained" / "reference" / f"{MODEL}.jsonl"
+def _fake_reference(out: Path, n: int = 260) -> Path:
+    path = out / "trained" / "reference" / f"{MODEL}_pool260.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = [{"id": f"s{i}", "question": f"Question {i}?", "answer_text": "The answer is C.", "gold": "C"}
             for i in range(n)]
@@ -111,14 +111,14 @@ def test_cli_train_end_to_end_tiny(tiny, out_root, capsys):
     assert len(sp["train"]) == 18 and len(sp["held"]) == 4 and not set(sp["train"]) & set(sp["held"])
     assert 3 not in sp["train"] + sp["held"]
     rs = tj["splits"]["reference"]
-    assert len(rs["train"]) == 8 and len(rs["held"]) == 2
+    assert len(rs["train"]) == 160 and len(rs["held"]) == 100
 
     trained = torch.load(d / "vllm_hook" / "assertive_L1.pt")["dir"]
     assert torch.equal(torch.load(d / "assertive.pt")[1], trained)
 
     e = json.loads((root / "eval.json").read_text(encoding="utf-8"))
     t = e["traits"]["assertive"]
-    assert len(t["kinds"]["trained"]["c=+1"]["margins"]) == 4 and len(t["kinds"]["trained"]["c=+1"]["kls"]) == 2
+    assert len(t["kinds"]["trained"]["c=+1"]["margins"]) == 4 and len(t["kinds"]["trained"]["c=+1"]["kls"]) == 100
     assert t["free_gen"]["unsteered"]["accuracy"] == 1.0 and t["free_gen"]["trained"]["c=-1"]["mean_tokens"] == 7
     assert e["free_gen"]["max_new_tokens"] == 4096 and tiny.count("generate 4096") == 7
     assert e["summary"] == {"assertive": t["pass"]["passed"]}
@@ -232,7 +232,7 @@ def test_cli_train_json_survives_failed_model_load(out_root, monkeypatch):
 def test_cli_train_needs_reference(tiny, out_root):
     with pytest.raises(SystemExit) as e:
         cli.main(_train_args(out_root))
-    assert "reference" in str(e.value)
+    assert "reference" in str(e.value) and "_pool260.jsonl" in str(e.value)
     assert not (out_root / "trained" / "run1").exists()
 
 
@@ -261,16 +261,16 @@ def test_cli_reference_writes_and_skips(tiny, tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_generate", fake_generate)
     out = tmp_path / "out"
     assert cli.main(["reference", "--model", MODEL, "--out", str(out), "--batch-size", "8"]) == 0
-    path = out / "trained" / "reference" / f"{MODEL}.jsonl"
+    path = out / "trained" / "reference" / f"{MODEL}_pool260.jsonl"
     rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
-    assert len(rows) == 100 and calls == [(100, 8, 512)]
+    assert len(rows) == 260 and calls == [(260, 8, 512)]
     assert set(rows[0]) == {"id", "question", "answer_text", "gold"}
     assert rows[0]["answer_text"] == "answer 0" and rows[0]["id"].startswith("supergpqa_")
     assert not list(path.parent.glob("*.tmp"))
-    meta = json.loads((path.parent / f"{MODEL}.meta.json").read_text(encoding="utf-8"))
+    meta = json.loads((path.parent / f"{MODEL}_pool260.meta.json").read_text(encoding="utf-8"))
     assert meta["temperature"] == 0.7 and meta["top_p"] == 0.8 and meta["top_k"] == 20
     assert meta["presence_penalty_applied"] is False and meta["max_new_tokens"] == 512
-    assert meta["batch_size"] == 8 and meta["n"] == 100 and isinstance(meta["seed"], int)
+    assert meta["batch_size"] == 8 and meta["n"] == 260 and meta["pool"] == "supergpqa 200-299 + 340-499" and isinstance(meta["seed"], int)
     for key in ("persvectrain_commit", "persvecfast_commit", "created"):
         assert isinstance(meta[key], str) and meta[key], key
 
@@ -281,7 +281,7 @@ def test_cli_reference_writes_and_skips(tiny, tmp_path, monkeypatch):
 def test_cli_train_copies_reference_meta(tiny, out_root):
     ref = _fake_reference(out_root)
     meta = {"temperature": 0.7, "seed": 123, "n": 10}
-    (ref.parent / f"{MODEL}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    (ref.parent / f"{MODEL}_pool260.meta.json").write_text(json.dumps(meta), encoding="utf-8")
     assert cli.main(_train_args(out_root, "--no-free-gen")) == 0
     tj = json.loads((out_root / "trained" / "run1" / "train.json").read_text(encoding="utf-8"))
     assert tj["sources"]["reference_meta"] == meta
@@ -303,3 +303,26 @@ def test_cli_train_min_pairs(tiny, out_root):
     tj = json.loads((out_root / "trained" / "run1" / "train.json").read_text(encoding="utf-8"))
     assert tj["config"]["min_pairs"] == 5 and tj["config"]["traits"] == ["assertive", "evil"]
     assert tj["dropped_traits"] == {}
+
+
+def test_reference_path_names_the_pool(tmp_path):
+    assert cli.reference_path(tmp_path, MODEL) == tmp_path / "trained" / "reference" / f"{MODEL}_pool260.jsonl"
+    assert cli.reference_meta_path(tmp_path, MODEL).name == f"{MODEL}_pool260.meta.json"
+
+
+def test_old_100_reference_is_not_used(tiny, out_root):
+    old = out_root / "trained" / "reference" / f"{MODEL}.jsonl"
+    old.parent.mkdir(parents=True)
+    old.write_text("", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        cli.main(_train_args(out_root))
+
+
+def test_split_reference_160_100_deterministic():
+    from persvectrain.train import RefAnswer
+    refs = [RefAnswer(id=f"s{i}", question="q", answer_text="a", gold="A") for i in range(260)]
+    tr, held = cli.split_reference(refs, 0)
+    assert (len(tr), len(held)) == (160, 100) and not {r.id for r in tr} & {r.id for r in held}
+    assert [r.id for r in held] == [r.id for r in cli.split_reference(refs, 0)[1]]
+    assert [r.id for r in held] != [r.id for r in cli.split_reference(refs, 1)[1]]
+    assert len(cli.split_reference(refs, 0, n_held=20)[0]) == 240

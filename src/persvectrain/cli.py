@@ -4,10 +4,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import time
 from dataclasses import MISSING, fields
 from pathlib import Path
-from types import SimpleNamespace
+
 
 import torch
 from persvecfast.extract import vector_file
@@ -25,8 +26,10 @@ from persvectrain.report import format_table, pick_run
 from persvectrain.steering import LOGPROB_NORMS, layer_type
 from persvectrain.train import RefAnswer, TrainConfig, TraitData, train
 
-REFERENCE_DATA = REPO / "data" / "supergpqa_200_299.jsonl"
+REFERENCE_DATA = REPO / "data" / "supergpqa_pool.jsonl"
 REFERENCE_MAX_NEW_TOKENS = 512
+REFERENCE_POOL = "supergpqa 200-299 + 340-499"
+N_HELD = 100
 
 
 def load_model(model_key: str):
@@ -39,12 +42,12 @@ def load_model(model_key: str):
 
 
 def reference_path(out: Path, model: str) -> Path:
-    return Path(out) / "trained" / "reference" / f"{model}.jsonl"
+    return Path(out) / "trained" / "reference" / f"{model}_pool260.jsonl"
 
 
 def reference_meta_path(out: Path, model: str) -> Path:
     """Sampling settings and provenance of the reference answers, next to the jsonl."""
-    return Path(out) / "trained" / "reference" / f"{model}.meta.json"
+    return Path(out) / "trained" / "reference" / f"{model}_pool260.meta.json"
 
 
 # ---------------------------------------------------------------- check
@@ -104,7 +107,7 @@ def cmd_reference(args) -> int:
     meta = {"model": args.model, "hf_repo": spec.hf_repo, "data": str(Path(args.data).resolve()),
             "temperature": spec.temperature, "top_p": spec.top_p, "top_k": spec.top_k,
             "presence_penalty": spec.presence_penalty, "presence_penalty_applied": False, "seed": seed,
-            "max_new_tokens": REFERENCE_MAX_NEW_TOKENS, "batch_size": args.batch_size, "n": len(rows),
+            "max_new_tokens": REFERENCE_MAX_NEW_TOKENS, "batch_size": args.batch_size, "n": len(rows), "pool": REFERENCE_POOL,
             "persvectrain_commit": git_commit(REPO), "persvecfast_commit": git_commit(PERSVECFAST_REPO),
             "created": _now()}
     # meta first (atomic): the jsonl is what marks the reference done, so a jsonl never lacks its meta
@@ -120,11 +123,13 @@ def load_reference(path: Path) -> list[RefAnswer]:
             for r in rows]
 
 
-def split_reference(refs: list[RefAnswer], seed: int) -> tuple[list[RefAnswer], list[RefAnswer]]:
-    """80/20 by file position, with data.split's seeded algorithm."""
-    wrapped = [SimpleNamespace(index=i, ref=r) for i, r in enumerate(refs)]
-    tr, held = data_mod.split(wrapped, seed=seed)
-    return [w.ref for w in tr], [w.ref for w in held]
+def split_reference(refs: list[RefAnswer], seed: int,
+                    n_held: int = N_HELD) -> tuple[list[RefAnswer], list[RefAnswer]]:
+    """Last n_held of data.split's seeded shuffle are held (260 questions: 160 train, 100 held)."""
+    idx = list(range(len(refs)))
+    random.Random(seed).shuffle(idx)
+    n_train = len(refs) - n_held
+    return [refs[i] for i in idx[:n_train]], [refs[i] for i in idx[n_train:]]
 
 
 # ---------------------------------------------------------------- train

@@ -87,11 +87,14 @@ traits, not double-count or cancel them (MAT-Steer).
 - First build step: check on the cluster that each trait has enough kept pairs (and was built from the
   non-thinking model, not a `nothink/` window); drop traits with fewer than about 20 kept pairs and say which.
   Answers are truncated to their first 512 tokens for training (most are cut at 2048; the opening carries the persona).
-- Keep-reasoning loss: SuperGPQA questions 200-299 from MA_Environments' `testbed/data/supergpqa.jsonl` (copied
-  into PersVecFast's data dir, as `careful-reasoning.json` did), formatted like the careful-reasoning trait
-  (question, lettered options, "Which option is correct?"). Split 80/20 train / held-out. The unsteered model's own
-  answers are generated once with the model card's sampling and cached; the KL is over those answer tokens
-  (teacher forcing), first 512 tokens.
+- Keep-reasoning loss (updated 2026-11-21: vLLM free generation, larger pool): a pool of 260 SuperGPQA questions, records 200-299 and 340-499 (0-based) of
+  MA_Environments' `testbed/data/supergpqa.jsonl`, in this repo as `data/supergpqa_pool.jsonl`, formatted like the
+  careful-reasoning trait (question, lettered options, "Which option is correct?"). Split with seed 0 into 160
+  KL-train / 100 held-out (was 100 questions, 80/20). Records 0-199 (the games' questions) and 300-339
+  (careful-reasoning) stay out. The unsteered model's own answers are generated once (HF, model card sampling) and
+  cached as `<model>_pool260.jsonl`; the KL is over those answer tokens (teacher forcing), first 512 tokens.
+  Risk: if the games sample questions past 199 they overlap this pool; check before reading game results as
+  independent of the KL questions.
 
 ## Losses
 
@@ -126,16 +129,18 @@ what helps?" ablation, then e.g. 0.1, 1, 10); its value is not fixed in this des
      persona margin of each trait inside held-out 2-trait mixes vs alone;
    - *(calls made after review)* the source vector also **rescaled to the trained vector's norm**, so "trained
      vs source" is compared at equal push size as well as at equal c (push size alone explains much of the cost);
-     and a free-generation check, since teacher-forced KL may not track what steering does to free answers:
-     answers to the 20 held-out SuperGPQA prompts (sampled, the model card's settings), their mean length and
-     accuracy next to unsteered.
+     and a free-generation check, since teacher-forced KL may not track what steering does to free answers
+     (updated 2026-11-21: vLLM free generation, larger pool): answers to the 100 held-out SuperGPQA questions with vLLM (PersVecFast's steer engine; the model card's
+     sampling, up to 15360 new tokens, the games' "ANSWER: <letter>" instruction), their mean length and accuracy next
+     to unsteered. Run as a separate `freegen` step after `train`.
    Written as one JSON per run plus a printed table.
 
    **Pass rule** (the user's choice: the strict version). A trait's trained vector passes when, on held-out data
    at c = +1 and at c = -1:
    - it moves the persona **at least as much** as the source vector (persona margin >= source);
    - it changes reasoning **less** than the source at the same c: lower KL, and free-generation length closer
-     to unsteered (accuracy: stage 3, see below);
+     to unsteered, and (accuracy@c, (updated 2026-11-21: vLLM free generation, larger pool)) **at least as accurate** as `source_full`, paired by question, a
+     difference within 1 SE counts as a tie;
    - its reasoning cost (KL, length change, accuracy change) is **no worse than its own random twin's** (random
      direction, same norm as the trained vector).
    *(Calls made by me.)* Held-out is small, so "at least as much" / "no worse" count a difference within 1 SE as a
@@ -193,12 +198,16 @@ on 300-700 pairs; here about 32 pairs, so 20 epochs = 160 steps per trait (warmu
 KL-then-steer (2406.15518) trains a rank-128 LoRA so the model tolerates steering (KL of steered vs unsteered on
 benign prompts); here the same KL is put on the vector instead. That combination is not in either paper.
 
-## Free-generation check: what it can and cannot decide
+## Free-generation check (updated 2026-11-21: vLLM free generation, larger pool)
 
 The 2B's unsteered SuperGPQA answers are long (about 19k characters; at 4096 tokens 75 % were cut in
-target_clamp_pilot.py), and 20 questions give an accuracy SE of about 0.1. So the built-in free-generation check
-reports length, the share cut at 4096 tokens, and accuracy with its SE, but the pass rule's accuracy part is decided
-in stage 3 (the games, 200 questions, vLLM, full length). The built-in pass rule uses persona margin, KL and length.
+target_clamp_pilot.py), so the check no longer truncates: vLLM through PersVecFast's steer engine, up to 15360 new
+tokens (the games' limit), the model card's sampling, the games' "ANSWER: <letter>" instruction, on the 100 held-out
+questions. Per trait: `trained`, `source_full` and `trained_random` at c = +1 and -1, plus one unsteered run; each
+steered request uses the same seed for every kind (paired). An answer is the last `ANSWER: X`; none counts as wrong.
+Per answer: tokens, whether it was cut, correct. With 100 questions the accuracy SE is about 0.05, so accuracy is back
+in the pass rule (accuracy@c above) next to persona margin, KL and length. Until `freegen` has run, a run's free-gen
+status is "pending" and the report shows it as not passed.
 
 ## Left to the builder
 
