@@ -36,7 +36,7 @@ def _fake_trait(src: Path, slug: str, n: int = 24, drop: tuple[int, ...] = (3, 7
                                                  "negative_model": MODEL}), encoding="utf-8")
 
 
-def _fake_reference(out: Path, n: int = 260) -> Path:
+def _fake_reference(out: Path, n: int = 20) -> Path:
     path = out / "trained" / "reference" / f"{MODEL}_pool260.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = [{"id": f"s{i}", "question": f"Question {i}?", "answer_text": "The answer is C.", "gold": "C"}
@@ -58,6 +58,7 @@ def tiny(monkeypatch):
         return ["so the answer is C"] * len(prompts), [7] * len(prompts)
 
     monkeypatch.setattr(cli, "load_model", fake_load)
+    monkeypatch.setattr(cli, "N_HELD", 5)  # tiny fake reference: 15 train / 5 held
     monkeypatch.setattr(ev, "generate_counted", fake_generate)
     return calls
 
@@ -111,14 +112,14 @@ def test_cli_train_end_to_end_tiny(tiny, out_root, capsys):
     assert len(sp["train"]) == 18 and len(sp["held"]) == 4 and not set(sp["train"]) & set(sp["held"])
     assert 3 not in sp["train"] + sp["held"]
     rs = tj["splits"]["reference"]
-    assert len(rs["train"]) == 160 and len(rs["held"]) == 100
+    assert len(rs["train"]) == 15 and len(rs["held"]) == 5
 
     trained = torch.load(d / "vllm_hook" / "assertive_L1.pt")["dir"]
     assert torch.equal(torch.load(d / "assertive.pt")[1], trained)
 
     e = json.loads((root / "eval.json").read_text(encoding="utf-8"))
     t = e["traits"]["assertive"]
-    assert len(t["kinds"]["trained"]["c=+1"]["margins"]) == 4 and len(t["kinds"]["trained"]["c=+1"]["kls"]) == 100
+    assert len(t["kinds"]["trained"]["c=+1"]["margins"]) == 4 and len(t["kinds"]["trained"]["c=+1"]["kls"]) == 5
     assert t["free_gen"]["unsteered"]["accuracy"] == 1.0 and t["free_gen"]["trained"]["c=-1"]["mean_tokens"] == 7
     assert e["free_gen"]["max_new_tokens"] == 4096 and tiny.count("generate 4096") == 7
     assert e["summary"] == {"assertive": t["pass"]["passed"]}
@@ -270,7 +271,8 @@ def test_cli_reference_writes_and_skips(tiny, tmp_path, monkeypatch):
     meta = json.loads((path.parent / f"{MODEL}_pool260.meta.json").read_text(encoding="utf-8"))
     assert meta["temperature"] == 0.7 and meta["top_p"] == 0.8 and meta["top_k"] == 20
     assert meta["presence_penalty_applied"] is False and meta["max_new_tokens"] == 512
-    assert meta["batch_size"] == 8 and meta["n"] == 260 and meta["pool"] == "supergpqa 200-299 + 340-499" and isinstance(meta["seed"], int)
+    assert meta["batch_size"] == 8 and meta["n"] == 260 and isinstance(meta["seed"], int)
+    assert meta["pool"] == "supergpqa 200-299 + 340-499"
     for key in ("persvectrain_commit", "persvecfast_commit", "created"):
         assert isinstance(meta[key], str) and meta[key], key
 

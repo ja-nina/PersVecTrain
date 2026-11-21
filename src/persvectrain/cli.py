@@ -9,7 +9,6 @@ import time
 from dataclasses import MISSING, fields
 from pathlib import Path
 
-
 import torch
 from persvecfast.extract import vector_file
 from persvecfast.models import MODELS, request_seed
@@ -107,7 +106,8 @@ def cmd_reference(args) -> int:
     meta = {"model": args.model, "hf_repo": spec.hf_repo, "data": str(Path(args.data).resolve()),
             "temperature": spec.temperature, "top_p": spec.top_p, "top_k": spec.top_k,
             "presence_penalty": spec.presence_penalty, "presence_penalty_applied": False, "seed": seed,
-            "max_new_tokens": REFERENCE_MAX_NEW_TOKENS, "batch_size": args.batch_size, "n": len(rows), "pool": REFERENCE_POOL,
+            "max_new_tokens": REFERENCE_MAX_NEW_TOKENS, "batch_size": args.batch_size, "n": len(rows),
+            "pool": REFERENCE_POOL,
             "persvectrain_commit": git_commit(REPO), "persvecfast_commit": git_commit(PERSVECFAST_REPO),
             "created": _now()}
     # meta first (atomic): the jsonl is what marks the reference done, so a jsonl never lacks its meta
@@ -124,8 +124,9 @@ def load_reference(path: Path) -> list[RefAnswer]:
 
 
 def split_reference(refs: list[RefAnswer], seed: int,
-                    n_held: int = N_HELD) -> tuple[list[RefAnswer], list[RefAnswer]]:
+                    n_held: int | None = None) -> tuple[list[RefAnswer], list[RefAnswer]]:
     """Last n_held of data.split's seeded shuffle are held (260 questions: 160 train, 100 held)."""
+    n_held = N_HELD if n_held is None else n_held  # read at call time
     idx = list(range(len(refs)))
     random.Random(seed).shuffle(idx)
     n_train = len(refs) - n_held
