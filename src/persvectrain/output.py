@@ -12,7 +12,7 @@ from pathlib import Path
 
 import persvecfast
 import torch
-from persvecfast.extract import random_control, vector_file
+from persvecfast.extract import RANDOM_CONTROL_SEED, random_control, vector_file
 from persvecfast.util import read_json, save_pt, write_json
 
 from persvectrain.train import TrainConfig
@@ -51,11 +51,11 @@ def prepare_run(cfg: TrainConfig) -> Path:
     return d
 
 
-def write_vectors(dir: Path, slug: str, layer: int, trained: torch.Tensor, src: Path, run_name: str,
-                  seed: int = 0) -> None:
+def write_vectors(dir: Path, slug: str, layer: int, trained: torch.Tensor, src: Path, run_name: str) -> None:
     """Write one trait's files into the run dir `dir`; `{slug}.pt` last (it marks the trait done).
 
-    Never writes into `src`. The random twin is random_control(trained, seed + layer), as PersVecFast does.
+    Never writes into `src`. The random twin is random_control(trained, RANDOM_CONTROL_SEED + layer) whatever the
+    training seed, as PersVecFast and MA_Environments do.
     """
     dir, src = Path(dir), Path(src)
     if _inside(dir, src):
@@ -70,7 +70,7 @@ def write_vectors(dir: Path, slug: str, layer: int, trained: torch.Tensor, src: 
                        "trained_norm": float(v.float().norm())}
     write_json(dir / f"{slug}.json", meta)
     save_pt(vector_file(dir, slug, layer), {"dir": v.clone()})
-    save_pt(vector_file(dir, slug, layer, random=True), {"dir": random_control(v, seed + layer)})
+    save_pt(vector_file(dir, slug, layer, random=True), {"dir": random_control(v, RANDOM_CONTROL_SEED + layer)})
     out_vecs = dict(source_vecs)
     out_vecs[layer] = v.clone()
     save_pt(dir / f"{slug}.pt", out_vecs)
@@ -84,6 +84,18 @@ def git_commit(repo: Path) -> str:
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "unknown"
 
 
+def git_dirty(repo: Path) -> bool | None:
+    """True when `git status --porcelain` lists anything (uncommitted or untracked files); None if unknown."""
+    try:
+        r = subprocess.run(["git", "status", "--porcelain"], cwd=str(repo), capture_output=True, text=True,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return bool(r.stdout.strip())
+
+
 def config_dict(cfg: TrainConfig) -> dict:
     return {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(cfg).items()}
 
@@ -95,6 +107,8 @@ def build_train_json(cfg: TrainConfig, sources: dict, layer_type: str | None, dr
         "seed": cfg.seed,
         "persvectrain_commit": git_commit(REPO),
         "persvecfast_commit": git_commit(PERSVECFAST_REPO),
+        "persvectrain_dirty": git_dirty(REPO),
+        "persvecfast_dirty": git_dirty(PERSVECFAST_REPO),
         "sources": sources,
         "layer_type": layer_type,
         "dropped_traits": dict(dropped_traits),

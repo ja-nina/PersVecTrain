@@ -32,7 +32,8 @@ def _fake_trait(src: Path, slug: str, n: int = 24, drop: tuple[int, ...] = (3, 7
     raw["kept_questions"] = kept_q
     torch.save(raw, src / f"{slug}_raw.pt")
     torch.save({l: torch.randn(HIDDEN, generator=g) for l in range(LAYERS)}, src / f"{slug}.pt")
-    (src / f"{slug}.json").write_text(json.dumps({"trait": slug}), encoding="utf-8")
+    (src / f"{slug}.json").write_text(json.dumps({"trait": slug, "model": MODEL, "extraction_model": MODEL,
+                                                 "negative_model": MODEL}), encoding="utf-8")
 
 
 def _fake_reference(out: Path, n: int = 10) -> Path:
@@ -87,9 +88,13 @@ def test_cli_train_end_to_end_tiny(tiny, out_root, capsys):
         assert (d / name).exists(), name
     assert not (d / "evil.pt").exists()
 
-    steps = [json.loads(l) for l in (root / "steps.jsonl").read_text(encoding="utf-8").splitlines()]
+    lines = [json.loads(l) for l in (root / "steps.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["kind"] == "start" and set(lines[0]["traits"]) == {"assertive"}
+    assert {"margin_pos", "margin_neg", "beta_margin_pos", "beta_margin_neg"} <= set(lines[0]["traits"]["assertive"])
+    steps = lines[1:]
     assert len(steps) == 5 and steps[0]["step"] == 0 and steps[0]["trait"] == "assertive"  # 18 train / 4
-    ts = [s["t"] for s in steps]
+    assert all(isinstance(d["margin"], float) and isinstance(d["cos_start"], float) for d in steps)
+    ts = [s["t"] for s in lines]
     assert ts == sorted(ts) and ts[0] >= 0
 
     tj = json.loads((root / "train.json").read_text(encoding="utf-8"))
@@ -98,6 +103,9 @@ def test_cli_train_end_to_end_tiny(tiny, out_root, capsys):
     assert tj["finished"] is True and tj["started"] and tj["ended"]
     assert set(tj["dropped_traits"]) == {"evil"}
     assert tj["sources"]["reference"] == str(ref)
+    assert tj["sources"]["reference_meta"] is None  # the fake reference has no meta file: warned, not fatal
+    assert tj["config"]["min_pairs"] == 20 and tj["config"]["logprob_norm"] == "sum"
+    assert "persvectrain_dirty" in tj and "persvecfast_dirty" in tj
     assert tj["sources"]["assertive"]["vectors"].endswith("assertive.pt")
     sp = tj["splits"]["assertive"]
     assert len(sp["train"]) == 18 and len(sp["held"]) == 4 and not set(sp["train"]) & set(sp["held"])
@@ -117,6 +125,7 @@ def test_cli_train_end_to_end_tiny(tiny, out_root, capsys):
     assert t["norms"]["trained"] == pytest.approx(float(trained.float().norm()))
     out = capsys.readouterr().out
     assert "evil" in out and "pass assertive:" in out
+    assert "reference meta" in out and "missing" in out
 
 
 def test_cli_train_no_free_gen_and_tokens(tiny, out_root):
@@ -239,6 +248,7 @@ def test_cli_check(out_root, capsys):
     assert cli.main(["check", "--model", MODEL, "--source", str(out_root), "--traits", "Assertive", "Evil"]) == 0
     text = capsys.readouterr().out
     assert "assertive" in text and "22" in text and "evil" in text
+    assert f"extraction_model {MODEL}" in text and f"negative_model {MODEL}" in text
 
 
 def test_cli_reference_writes_and_skips(tiny, tmp_path, monkeypatch):
@@ -257,6 +267,39 @@ def test_cli_reference_writes_and_skips(tiny, tmp_path, monkeypatch):
     assert set(rows[0]) == {"id", "question", "answer_text", "gold"}
     assert rows[0]["answer_text"] == "answer 0" and rows[0]["id"].startswith("supergpqa_")
     assert not list(path.parent.glob("*.tmp"))
+    meta = json.loads((path.parent / f"{MODEL}.meta.json").read_text(encoding="utf-8"))
+    assert meta["temperature"] == 0.7 and meta["top_p"] == 0.8 and meta["top_k"] == 20
+    assert meta["presence_penalty_applied"] is False and meta["max_new_tokens"] == 512
+    assert meta["batch_size"] == 8 and meta["n"] == 100 and isinstance(meta["seed"], int)
+    for key in ("persvectrain_commit", "persvecfast_commit", "created"):
+        assert isinstance(meta[key], str) and meta[key], key
 
     assert cli.main(["reference", "--model", MODEL, "--out", str(out)]) == 0
     assert len(calls) == 1  # skipped
+
+
+def test_cli_train_copies_reference_meta(tiny, out_root):
+    ref = _fake_reference(out_root)
+    meta = {"temperature": 0.7, "seed": 123, "n": 10}
+    (ref.parent / f"{MODEL}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    assert cli.main(_train_args(out_root, "--no-free-gen")) == 0
+    tj = json.loads((out_root / "trained" / "run1" / "train.json").read_text(encoding="utf-8"))
+    assert tj["sources"]["reference_meta"] == meta
+
+
+def test_cli_train_resolves_paths(tiny, out_root, monkeypatch):
+    _fake_reference(out_root)
+    monkeypatch.chdir(out_root.parent)
+    args = _train_args(Path("out"), "--no-free-gen")
+    assert cli.main(args) == 0
+    tj = json.loads((out_root / "trained" / "run1" / "train.json").read_text(encoding="utf-8"))
+    assert Path(tj["config"]["source"]).is_absolute() and Path(tj["config"]["out"]).is_absolute()
+    assert Path(tj["config"]["out"]) == out_root.resolve()
+
+
+def test_cli_train_min_pairs(tiny, out_root):
+    _fake_reference(out_root)
+    assert cli.main(_train_args(out_root, "--no-free-gen", "--min-pairs", "5")) == 0
+    tj = json.loads((out_root / "trained" / "run1" / "train.json").read_text(encoding="utf-8"))
+    assert tj["config"]["min_pairs"] == 5 and tj["config"]["traits"] == ["assertive", "evil"]
+    assert tj["dropped_traits"] == {}

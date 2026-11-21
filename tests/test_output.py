@@ -4,10 +4,13 @@ import hashlib
 import json
 from pathlib import Path
 
+import subprocess
+
 import pytest
 import torch
+from persvecfast.extract import RANDOM_CONTROL_SEED, random_control
 
-from persvectrain.output import build_train_json, prepare_run, run_dir, source_dir, write_vectors
+from persvectrain.output import build_train_json, git_dirty, prepare_run, run_dir, source_dir, write_vectors
 from persvectrain.train import TrainConfig
 
 HIDDEN = 16
@@ -75,7 +78,7 @@ def test_write_vectors_layout(tmp_path):
     dst.mkdir(parents=True)
     trained = torch.randn(HIDDEN, generator=torch.Generator().manual_seed(9))
 
-    write_vectors(dst, "assertive", 1, trained, src, "r1", seed=0)
+    write_vectors(dst, "assertive", 1, trained, src, "r1")
 
     for name in ("assertive_responses.json", "assertive_raw.pt", "assertive.json", "assertive.pt",
                  "vllm_hook/assertive_L1.pt", "vllm_hook/assertive_L1_random.pt"):
@@ -92,6 +95,7 @@ def test_write_vectors_layout(tmp_path):
     assert set(rnd) == {"dir"}
     assert torch.isclose(rnd["dir"].norm(), trained.norm())
     assert not torch.allclose(rnd["dir"], trained)
+    assert torch.equal(rnd["dir"], random_control(trained, RANDOM_CONTROL_SEED + 1))  # 0 + layer, as PersVecFast
     meta = json.loads((dst / "assertive.json").read_text(encoding="utf-8"))
     assert meta["trait"] == "Assertive"
     assert meta["trained"]["run_name"] == "r1" and meta["trained"]["layer"] == 1
@@ -116,10 +120,22 @@ def test_train_json_has_config_seed_commits(tmp_path):
                          layer_type="full_attention", dropped_traits={"evil": "missing"},
                          splits={"assertive": {"train": [0], "held": [1]}, "reference": {"train": ["a"],
                                                                                            "held": ["b"]}})
-    for key in ("config", "seed", "persvectrain_commit", "persvecfast_commit", "sources", "layer_type",
-                "dropped_traits", "splits"):
+    for key in ("config", "seed", "persvectrain_commit", "persvecfast_commit", "persvectrain_dirty",
+                "persvecfast_dirty", "sources", "layer_type", "dropped_traits", "splits"):
         assert key in d, key
     assert d["seed"] == cfg.seed
     assert d["config"]["source"] == str(cfg.source) and d["config"]["layer"] == 1
     assert isinstance(d["persvectrain_commit"], str) and isinstance(d["persvecfast_commit"], str)
+    assert d["persvectrain_dirty"] in (True, False, None) and d["persvecfast_dirty"] in (True, False, None)
+    assert d["config"]["logprob_norm"] == "sum" and d["config"]["min_pairs"] == 20
     json.dumps(d)  # serialisable
+
+
+def test_git_dirty(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert git_dirty(repo) is None  # not a repo
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+    assert git_dirty(repo) is False
+    (repo / "x.txt").write_text("x", encoding="utf-8")
+    assert git_dirty(repo) is True

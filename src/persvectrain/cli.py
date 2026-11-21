@@ -19,10 +19,10 @@ from persvectrain import data as data_mod
 from persvectrain.data import full_source_vector, load_pairs, start_vector, supergpqa_prompts, usable_traits
 from persvectrain.evaluate import evaluate
 from persvectrain.generate import generate as _generate
-from persvectrain.output import (REPO, build_train_json, prepare_run, run_dir, run_root, source_dir,
-                                 write_vectors)
+from persvectrain.output import (PERSVECFAST_REPO, REPO, build_train_json, git_commit, prepare_run, run_dir,
+                                 run_root, source_dir, write_vectors)
 from persvectrain.report import format_table, pick_run
-from persvectrain.steering import layer_type
+from persvectrain.steering import LOGPROB_NORMS, layer_type
 from persvectrain.train import RefAnswer, TrainConfig, TraitData, train
 
 REFERENCE_DATA = REPO / "data" / "supergpqa_200_299.jsonl"
@@ -42,7 +42,24 @@ def reference_path(out: Path, model: str) -> Path:
     return Path(out) / "trained" / "reference" / f"{model}.jsonl"
 
 
+def reference_meta_path(out: Path, model: str) -> Path:
+    """Sampling settings and provenance of the reference answers, next to the jsonl."""
+    return Path(out) / "trained" / "reference" / f"{model}.meta.json"
+
+
 # ---------------------------------------------------------------- check
+
+
+_MODEL_FIELDS = ("model", "extraction_model", "negative_model")
+
+
+def _model_fields(path: Path) -> str:
+    """`; model X, extraction_model Y, ...` from a trait's {slug}.json (the fields present), else ""."""
+    if not path.exists():
+        return ""
+    meta = read_json(path)
+    parts = [f"{k} {meta[k]}" for k in _MODEL_FIELDS if meta.get(k) is not None]
+    return "; " + ", ".join(parts) if parts else ""
 
 
 def cmd_check(args) -> int:
@@ -51,7 +68,7 @@ def cmd_check(args) -> int:
     kept, dropped = usable_traits(src, slugs, args.min_pairs)
     print(f"source {src}")
     for slug in kept:
-        print(f"  {slug}: {len(load_pairs(src, slug))} kept pairs")
+        print(f"  {slug}: {len(load_pairs(src, slug))} kept pairs{_model_fields(src / f'{slug}.json')}")
     for slug, reason in dropped.items():
         print(f"  {slug}: dropped ({reason})")
     return 0 if kept else 1
@@ -78,11 +95,20 @@ def cmd_reference(args) -> int:
     prompts = [chat_prompt(tok, NEUTRAL_SYSTEM_PROMPT, it["question"], False) for it in items]
     log(f"reference: {len(prompts)} prompts, temperature {spec.temperature} top_p {spec.top_p} top_k {spec.top_k}; "
         f"presence_penalty {spec.presence_penalty} is not applied in HF generate")
-    torch.manual_seed(request_seed(args.model, "reference"))
+    seed = request_seed(args.model, "reference")
+    torch.manual_seed(seed)
     answers = _generate(model, tok, prompts, args.batch_size, REFERENCE_MAX_NEW_TOKENS,
                         temperature=spec.temperature, top_p=spec.top_p, top_k=spec.top_k)
     rows = [{"id": it["id"], "question": it["question"], "answer_text": a, "gold": it["answer"]}
             for it, a in zip(items, answers)]
+    meta = {"model": args.model, "hf_repo": spec.hf_repo, "data": str(Path(args.data).resolve()),
+            "temperature": spec.temperature, "top_p": spec.top_p, "top_k": spec.top_k,
+            "presence_penalty": spec.presence_penalty, "presence_penalty_applied": False, "seed": seed,
+            "max_new_tokens": REFERENCE_MAX_NEW_TOKENS, "batch_size": args.batch_size, "n": len(rows),
+            "persvectrain_commit": git_commit(REPO), "persvecfast_commit": git_commit(PERSVECFAST_REPO),
+            "created": _now()}
+    # meta first (atomic): the jsonl is what marks the reference done, so a jsonl never lacks its meta
+    write_json(reference_meta_path(args.out, args.model), meta)
     _write_jsonl_atomic(path, rows)
     log(f"reference: wrote {path}")
     return 0
@@ -107,7 +133,8 @@ def split_reference(refs: list[RefAnswer], seed: int) -> tuple[list[RefAnswer], 
 def _config_from_args(args, traits: list[str]) -> TrainConfig:
     kw = {f.name: getattr(args, f.name) for f in fields(TrainConfig)}
     kw["traits"] = traits
-    kw["source"], kw["out"] = Path(args.source), Path(args.out)
+    # absolute: train.json's paths stay valid whatever directory `eval` / the games are run from
+    kw["source"], kw["out"] = Path(args.source).resolve(), Path(args.out).resolve()
     return TrainConfig(**kw)
 
 
@@ -118,7 +145,7 @@ def _now() -> str:
 def cmd_train(args) -> int:
     cfg = _config_from_args(args, [slugify(t) for t in args.traits])
     src = source_dir(cfg)
-    kept, dropped = usable_traits(src, cfg.traits)
+    kept, dropped = usable_traits(src, cfg.traits, cfg.min_pairs)
     for slug, reason in dropped.items():
         print(f"dropped trait {slug}: {reason}", flush=True)
     if not kept:
@@ -147,6 +174,13 @@ def cmd_train(args) -> int:
                          "vectors": str(src / f"{slug}.pt"), "json": str(src / f"{slug}.json")}
         splits[slug] = {"train": [p.index for p in tr], "held": [p.index for p in held]}
     sources["reference"] = str(ref_file)
+    meta_file = reference_meta_path(cfg.out, cfg.model)
+    if meta_file.exists():
+        sources["reference_meta"] = read_json(meta_file)
+    else:
+        sources["reference_meta"] = None
+        print(f"warning: reference meta {meta_file} missing (sampling settings of the reference unknown); "
+              f"continuing", flush=True)
     splits["reference"] = {"train": [r.id for r in ref_train], "held": [r.id for r in ref_held]}
 
     vec_dir = prepare_run(cfg)
@@ -170,7 +204,7 @@ def cmd_train(args) -> int:
         vectors = train(model, tok, cfg, traits, ref_train, log_step)
 
     for slug in kept:
-        write_vectors(vec_dir, slug, cfg.layer, vectors[slug], src, cfg.run_name, seed=cfg.seed)
+        write_vectors(vec_dir, slug, cfg.layer, vectors[slug], src, cfg.run_name)
     # evaluate the vectors as saved (cast to the source dtype), as `eval` on this run would
     evaluate(model, tok, cfg, traits, load_trained(vec_dir, kept, cfg.layer), ref_held,
              free_gen=not args.no_free_gen, free_gen_tokens=args.free_gen_tokens)
@@ -201,7 +235,7 @@ def cmd_eval(args) -> int:
         raise SystemExit(f"no run at {root} (train.json missing)")
     meta = read_json(root / "train.json")
     kw = dict(meta["config"])
-    kw["source"], kw["out"] = Path(kw["source"]), Path(args.out)
+    kw["source"], kw["out"] = Path(kw["source"]), Path(args.out).resolve()
     cfg = TrainConfig(**kw)
     src = source_dir(cfg)
     splits = meta["splits"]
@@ -253,7 +287,7 @@ def cmd_report(args) -> int:
 # ---------------------------------------------------------------- parser
 
 _REQUIRED_TYPES = {"model": str, "layer": int, "mode": str, "source": str, "out": str, "run_name": str}
-_CHOICES = {"mode": ("solo", "joint"), "init": ("dom", "zero")}
+_CHOICES = {"mode": ("solo", "joint"), "init": ("dom", "zero"), "logprob_norm": LOGPROB_NORMS}
 
 
 def _add_train_flags(p: argparse.ArgumentParser) -> None:
