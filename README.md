@@ -19,6 +19,8 @@ PersVecFast (extracted responses and activations) and imports its `persvecfast` 
 - `train` - train vectors (`--mode solo` or `joint`) and write `train.json`, `steps.jsonl`, the vectors and
   `eval.json`
 - `eval` - re-run the evaluation of an existing run
+- `freegen --out O --run-name R` - free generation of a finished run on vLLM (unsteered, and per trait trained /
+  source_full / trained_random at c = +-1): fills eval.json's `free_gen` block and recomputes the pass rule
 - `report --out O --runs R1 R2 ...` - one pass/fail table over runs and traits, and the run that passes the most
   traits (tie: larger mean trained margin at c = +-1), or "no run passes"
 
@@ -39,76 +41,68 @@ each part.
 
 ## Cluster run
 
-All paths below are the shared PersVecFast output root. Run from the PersVecTrain checkout with the PersVecFast
-environment active. Use PersVecFast's Hugging Face cache, so the model is not downloaded again (the sbatch
-script otherwise defaults to `./.cache/huggingface` in the submit directory):
+All paths are the shared PersVecFast output root. Run everything from the PersVecTrain checkout. `train` runs on
+Hugging Face (teacher-forced evaluation); free generation is a separate `freegen` step on vLLM (PersVecFast's
+steer engine), run in the same job by `slurm/run.sbatch` (two processes, so the HF model's GPU memory is freed
+first). A run is `pending` until its `freegen` has finished: `report` shows it as PENDING and never picks it.
 
-    export HF_HOME=/scratch/inf0/user/nzukowsk/PersVecFast/.cache/huggingface
+Update:
 
-Install (clone next to the existing code directories):
-
-    git clone <PersVecTrain repo url> PersVecTrain && cd PersVecTrain
+    git pull
     pip install -e ../PersVecFast -e .
 
-Slurm opens `--output=slurm-logs/...` before the job starts, so create the log dir once (`sweep.sh` does it too):
+Environment (PersVecFast's Hugging Face cache, so the model is not downloaded again; Slurm opens the log file
+before the job starts, so the log dir must exist):
 
+    micromamba activate pvf
+    export HF_HOME=/scratch/inf0/user/nzukowsk/PersVecFast/.cache/huggingface
     mkdir -p slurm-logs
 
-Check the inputs:
+Reference answers for the 260-question pool (the KL term's reference; the sweep's own `reference` job then finds
+them and skips):
 
-    python -m persvectrain check --model qwen3.5-2b \
-        --source /scratch/inf0/user/nzukowsk/PersVecFast/out \
-        --traits Assertive Sycophantic Opportunistic Empathy Evil Sarcastic Agreeableness
+    REF=$(sbatch --parsable slurm/train.sbatch reference --model qwen3.5-2b         --out /scratch/inf0/user/nzukowsk/PersVecFast/out)
 
-Timing job (one epoch, one trait, with free generation; the `reference` job must finish first). It writes the
-reference answers, so the sweep's own `reference` job then finds them and skips:
+Timing job: one trait, one epoch, free generation on, after the reference job:
 
-    REF=$(sbatch --parsable slurm/train.sbatch reference --model qwen3.5-2b \
-        --out /scratch/inf0/user/nzukowsk/PersVecFast/out)
-    sbatch --dependency=afterok:$REF slurm/train.sbatch train --model qwen3.5-2b --layer 12 --mode solo \
-        --traits Assertive --epochs 1 --run-name timing \
-        --source /scratch/inf0/user/nzukowsk/PersVecFast/out \
-        --out /scratch/inf0/user/nzukowsk/PersVecFast/out
+    sbatch --dependency=afterok:$REF slurm/run.sbatch --model qwen3.5-2b --layer 12 --mode solo         --traits Assertive --epochs 1 --beta 0.01 --run-name timing_vllm         --source /scratch/inf0/user/nzukowsk/PersVecFast/out         --out /scratch/inf0/user/nzukowsk/PersVecFast/out
 
-Seconds per training step (over ~10 s per step: stop and report before the sweep):
+Reading it (job log `slurm-logs/pvt-<job>.out`, and `trained/timing_vllm/eval.json`):
 
-    python -c "import json,sys; L=[json.loads(l) for l in open(sys.argv[1])]; S=[d for d in L if d['kind']!='start']; print((S[-1]['t']-L[0]['t'])/len(S),'s/step over',len(S),'steps')" \
-        /scratch/inf0/user/nzukowsk/PersVecFast/out/trained/timing/steps.jsonl
+- the free-generation time: `timing.free_gen_s` in `eval.json` (seconds), or the log line
+  `freegen timing_vllm: done in <s> s`; `timing.teacher_forced_s` is the HF evaluation, and `started` / `ended`
+  in `train.json` the whole training
+- the free-gen table (tokens, cut share and accuracy per trait x kind x c, then the pass line per trait) is
+  printed at the end of the log, after the `freegen timing_vllm: done` line
+- seconds per training step: `t` in `trained/timing_vllm/steps.jsonl` (stop and report if over ~10 s per step)
+- BiPO saturation: `beta_margin_pos` / `beta_margin_neg` in the first line of `steps.jsonl` (`beta * margin` of
+  the start vector; above ~5 almost no persona gradient): rerun with a smaller `--beta` under a new `--run-name`
+  before the sweep
 
-Eval time: `timing` in `trained/timing/eval.json` (`teacher_forced_s`, `free_gen_s`, seconds), or the
-timestamped `eval: ... starts` / `eval: ... done` lines in the job's `slurm-logs/pvt-<job>.out`. The whole run's
-wall time is `started` to `ended` in `train.json`. A full solo run is 20 epochs times seven traits of training
-plus one eval per trait: check that it fits the 20 h limit of `train.sbatch`.
+Sweep: one `reference` job, then four solo runs `solo_kl0`, `solo_kl0.1`, `solo_kl1`, `solo_kl10` (each train +
+freegen in one job) after it. `SOURCE`, `OUT`, `TRAITS` env vars override the defaults; `TRAIN_EXTRA` is appended
+to every train's arguments:
 
-BiPO saturation, from the start line (`beta * margin` of the start vector; the loss is `-logsigmoid(beta *
-margin)`, whose gradient is about `exp(-beta * margin)`, so a large value means almost no persona gradient):
+    TRAIN_EXTRA="--beta 0.01" bash slurm/sweep.sh qwen3.5-2b 12
 
-    python -c "import json,sys; d=json.loads(open(sys.argv[1]).readline()); print({s: (r['beta_margin_pos'], r['beta_margin_neg']) for s, r in d['traits'].items()})" \
-        /scratch/inf0/user/nzukowsk/PersVecFast/out/trained/timing/steps.jsonl
+It prints the job ids and the report command. Report, once all four have finished:
 
-Rule: if `beta * margin` at the start is above ~5 (at c = +1 or -1), rerun the timing job (new `--run-name`)
-with a smaller `--beta` (e.g. `1/margin`) or with `--logprob-norm mean` before the sweep, and run the sweep
-with the same setting (pass it to the train jobs, e.g. by adding it in `slurm/sweep.sh`). Per-step `margin` and
-`cos_start` in `steps.jsonl` show whether training still moves the vector.
-
-Sweep (one `reference` job, then four solo runs `solo_kl0`, `solo_kl0.1`, `solo_kl1`, `solo_kl10` after it;
-`SOURCE`, `OUT`, `TRAITS` env vars override the defaults):
-
-    bash slurm/sweep.sh qwen3.5-2b 12
-
-Report, once all four have finished:
-
-    python -m persvectrain report --out /scratch/inf0/user/nzukowsk/PersVecFast/out \
-        --runs solo_kl0 solo_kl0.1 solo_kl1 solo_kl10
+    python -m persvectrain report --out /scratch/inf0/user/nzukowsk/PersVecFast/out         --runs solo_kl0 solo_kl0.1 solo_kl1 solo_kl10
 
 Joint run at the picked lambda_kl (the value in the picked run's name, e.g. `solo_kl1` gives `KL=1`):
 
     KL=1
-    sbatch slurm/train.sbatch train --model qwen3.5-2b --layer 12 --mode joint --lambda-o 1 --lambda-kl $KL \
-        --traits Assertive Sycophantic Opportunistic Empathy Evil Sarcastic Agreeableness \
-        --run-name joint_kl$KL \
-        --source /scratch/inf0/user/nzukowsk/PersVecFast/out \
-        --out /scratch/inf0/user/nzukowsk/PersVecFast/out
+    sbatch slurm/run.sbatch --model qwen3.5-2b --layer 12 --mode joint --beta 0.01 --lambda-o 1 --lambda-kl $KL         --traits Assertive Sycophantic Opportunistic Empathy Evil Sarcastic Agreeableness         --run-name joint_kl$KL         --source /scratch/inf0/user/nzukowsk/PersVecFast/out         --out /scratch/inf0/user/nzukowsk/PersVecFast/out
+
+`freegen` alone (an existing run whose status is `pending`, e.g. after a failed free generation) runs through the generic runner, which sets the same vLLM environment:
+
+    sbatch slurm/train.sbatch freegen --out /scratch/inf0/user/nzukowsk/PersVecFast/out --run-name solo_kl1
+
+`--no-free-gen` on `run.sbatch` (or `train`) skips free generation: the run's free_gen status is `disabled`, its
+length and accuracy checks are skipped (listed in `skipped`) and `report` shows it normally. Re-running `eval`
+on such a run without `--no-free-gen` makes it `pending` again. A run trained before this change (status
+`pending` from the old Hugging Face path, or with Hugging Face free-gen results) must be rerun under a new
+`--run-name`.
 
 ## Using the output in MA_Environments
 

@@ -260,7 +260,8 @@ def evaluate(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], trained
     if cfg.mode == "joint" and len(slugs) >= 2:
         with torch.no_grad():
             res["joint"] = _joint(model, cfg, slugs, vecs, held, res["traits"])
-    if free_gen and previous and previous.get("free_gen"):
+    # a previous "disabled" run has no free-gen block to keep: the re-run stays "pending" so `freegen` can run
+    if free_gen and previous and previous.get("free_gen") and previous["free_gen"].get("status") != "disabled":
         res["free_gen"] = previous["free_gen"]
         res["timing"]["free_gen_s"] = previous.get("timing", {}).get("free_gen_s")
         for s in slugs:

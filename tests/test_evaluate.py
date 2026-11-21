@@ -359,3 +359,12 @@ def test_eval_margins_follow_logprob_norm(tiny_model, char_tok, tmp_path):
             assert m["traits"]["t1"]["kinds"][kind][c]["margins"] == pytest.approx(want, rel=1e-4, abs=1e-6)
     # KL is per token either way
     assert m["traits"]["t1"]["kinds"]["trained"]["c=+1"]["kls"] == s["traits"]["t1"]["kinds"]["trained"]["c=+1"]["kls"]
+
+
+def test_evaluate_rerun_after_disabled_resets_to_pending(tiny_model, char_tok, tmp_path):
+    cfg = _cfg(tmp_path)
+    td = _trait("t1", 1)
+    off = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2), free_gen=False)
+    assert off["free_gen"]["status"] == "disabled"
+    res = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2), previous=off)
+    assert res["free_gen"] == {"enabled": True, "status": "pending"} and "free_gen" not in res["traits"]["t1"]

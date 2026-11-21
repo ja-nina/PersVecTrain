@@ -40,11 +40,16 @@ def instruction(n_options: int) -> str:
 
 
 def parse_answer(text: str, n_options: int) -> str | None:
-    """The last `ANSWER` (any case), optional `:` / `*` / spaces / `(`, then one of the question's option letters
-    (any case, not followed by another letter); upper-case, or None when there is none."""
-    letters = LETTERS[:n_options]
-    matches = re.findall(rf"ANSWER[\s:*(]*([{letters}])(?![A-Z])", text, flags=re.IGNORECASE)
-    return matches[-1].upper() if matches else None
+    """The letter after the LAST `ANSWER` (any case; optional `:` / `*` / spaces / `(` between): one of the
+    question's option letters (any case, not followed by another letter), upper-cased. None when there is no
+    marker or the last marker's letter is not valid (none = wrong)."""
+    marks = list(re.finditer(r"ANSWER", text, flags=re.IGNORECASE))
+    if not marks:
+        return None
+    m = re.match(rf"[\s:*(]*([A-Za-z])(?![A-Za-z])", text[marks[-1].end():])
+    if m is None or m.group(1).upper() not in LETTERS[:n_options]:
+        return None
+    return m.group(1).upper()
 
 
 def load_tokenizer(model_key: str):

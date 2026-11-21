@@ -33,6 +33,9 @@ KINDS = ("trained", "source_full", "trained_random")
     ("ANSWER: (D)", 4, "D"),
     ("**ANSWER:** B", 4, "B"),
     ("ANSWER: A at first. Re-checking. ANSWER: B", 4, "B"),
+    ("ANSWER: A. Hmm, the answer is unclear.", 4, None),  # the LAST marker decides, and it has no valid letter
+    ("ANSWER: A ... ANSWER: E", 4, None),  # last marker's letter is beyond the options: none, not the earlier A
+    ("ANSWER: A ... ANSWER: Because", 4, None),
     ("ANSWER: E", 4, None),
     ("ANSWER: J", 10, "J"),
     ("The option is C", 4, None),

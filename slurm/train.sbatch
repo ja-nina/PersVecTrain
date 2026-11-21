@@ -6,12 +6,12 @@
 #SBATCH --mem=64G
 #SBATCH --time=20:00:00
 #SBATCH --output=slurm-logs/pvt-%j.out
-# Usage: sbatch slurm/train.sbatch <persvectrain subcommand and args>, e.g. train --model qwen3.5-2b --layer 12 ...
-# 20 h (PersVecFast's default): a joint run plus free generation can exceed 12 h. Run `mkdir -p slurm-logs` first.
+# Usage: sbatch slurm/train.sbatch <persvectrain subcommand and args>, e.g. reference --model qwen3.5-2b ...,
+# or freegen --out O --run-name R. The vLLM env vars are set, so freegen works here too.
+# For train followed by freegen in one job use slurm/run.sbatch. Run `mkdir -p slurm-logs` first.
 set -euo pipefail
 mkdir -p slurm-logs  # too late for this job's own log: create it before sbatch (README, sweep.sh)
-PYTHON="${PYTHON:-$(command -v python || true)}"  # active env at sbatch time (sbatch exports PATH)
-[ -x "$PYTHON" ] || { echo "no python found: activate the env (with persvecfast and persvectrain installed) before sbatch" >&2; exit 1; }
-export HF_HOME="${HF_HOME:-$PWD/.cache/huggingface}"
+source "${PVT_LIB:-${SLURM_SUBMIT_DIR:-$PWD}/slurm/lib.sh}"  # sbatch copies this script: find lib.sh via the submit dir
+pvt_setup_env
 echo "$(date)  $(hostname)  python=$PYTHON"
 "$PYTHON" -m persvectrain "$@"

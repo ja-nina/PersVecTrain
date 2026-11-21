@@ -63,3 +63,35 @@ def test_report_cli_no_run_passes(tmp_path, capsys):
     _write_eval(tmp_path, "bad", _eval(x=_trait(False)))
     assert cli.main(["report", "--out", str(tmp_path), "--runs", "bad"]) == 0
     assert "no run passes" in capsys.readouterr().out
+
+
+def _pending(ev: dict) -> dict:
+    ev["free_gen"] = {"enabled": True, "status": "pending"}
+    return ev
+
+
+def test_report_pending_run_never_picked_even_if_passed():
+    evals = {"pend": _pending(_eval(x=_trait(True), y=_trait(True))), "done": _eval(x=_trait(True))}
+    assert pick_run(evals) == "done"
+    assert pick_run({"pend": _pending(_eval(x=_trait(True)))}) is None
+
+
+def test_report_table_shows_pending_per_trait():
+    text = format_table({"pend": _pending(_eval(x=_trait(True), y=_trait(False))), "done": _eval(x=_trait(True))})
+    pend_row = [ln for ln in text.splitlines() if ln.startswith("pend")][0]
+    assert pend_row.split().count("PENDING") == 2 and "PASS" not in pend_row and "FAIL" not in pend_row
+    assert "PASS" in [ln for ln in text.splitlines() if ln.startswith("done")][0]
+
+
+def test_report_disabled_run_is_reported_normally():
+    ev = _eval(x=_trait(True))
+    ev["free_gen"] = {"enabled": False, "status": "disabled"}
+    assert pick_run({"off": ev}) == "off"
+    assert "PASS" in format_table({"off": ev})
+
+
+def test_report_cli_pending_not_picked(tmp_path, capsys):
+    _write_eval(tmp_path, "pend", _pending(_eval(x=_trait(True))))
+    assert cli.main(["report", "--out", str(tmp_path), "--runs", "pend"]) == 0
+    out = capsys.readouterr().out
+    assert "PENDING" in out and "no run passes" in out

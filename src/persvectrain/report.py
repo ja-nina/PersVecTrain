@@ -4,6 +4,11 @@ from __future__ import annotations
 _MARGIN_CS = ("c=+1", "c=-1")
 
 
+def is_pending(ev: dict) -> bool:
+    """Free generation not run yet (`freegen` still to do): the run's pass flags are not final."""
+    return (ev.get("free_gen") or {}).get("status") == "pending"
+
+
 def n_passed(ev: dict) -> int:
     return sum(1 for t in ev["traits"].values() if t["pass"]["passed"])
 
@@ -20,9 +25,12 @@ def mean_trained_margin(ev: dict) -> float:
 
 
 def pick_run(evals: dict[str, dict]) -> str | None:
-    """The run passing the most traits (ties: larger mean trained margin, then first listed); None if none pass."""
+    """The run passing the most traits (ties: larger mean trained margin, then first listed); None if none pass.
+    Runs with pending free generation are never picked."""
     best, best_key = None, None
     for name, ev in evals.items():
+        if is_pending(ev):
+            continue
         n = n_passed(ev)
         if n == 0:
             continue
@@ -32,17 +40,19 @@ def pick_run(evals: dict[str, dict]) -> str | None:
     return best
 
 
-def _cell(trait_eval: dict) -> str:
+def _cell(trait_eval: dict, pending: bool = False) -> str:
+    if pending:
+        return "PENDING"
     p = trait_eval["pass"]
     return "PASS" if p["passed"] else "FAIL (" + ", ".join(p["failed"]) + ")"
 
 
 def format_table(evals: dict[str, dict]) -> str:
-    """Rows: runs; columns: traits (union, in first-seen order); cells PASS or FAIL (failed checks)."""
+    """Rows: runs; columns: traits (union, in first-seen order); cells PASS or FAIL (failed checks), PENDING while free generation is pending."""
     traits: list[str] = []
     for ev in evals.values():
         traits += [t for t in ev["traits"] if t not in traits]
-    cells = [[name] + [_cell(ev["traits"][t]) if t in ev["traits"] else "-" for t in traits]
+    cells = [[name] + [_cell(ev["traits"][t], is_pending(ev)) if t in ev["traits"] else "-" for t in traits]
              for name, ev in evals.items()]
     rows = [["run"] + traits] + cells
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
