@@ -112,21 +112,29 @@ def freegen_vector_paths(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[s
     return {slug: {kind: d / f"{slug}_{kind}.pt" for kind in FREE_GEN_KINDS} for slug in slugs}
 
 
-def write_freegen_vectors(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[str, Path]]:
-    """run_root/freegen_vectors/{slug}_{kind}.pt = {"dir": vector} for the three free-gen kinds; absolute paths.
+def freegen_vectors(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[str, torch.Tensor]]:
+    """{slug: {kind: vector}} for the three free-gen kinds; nothing written.
 
     trained: the run's vllm_hook file as saved; source_full: the source's vector at the layer; trained_random:
     random_control(trained, RANDOM_CONTROL_SEED + layer), as write_vectors and evaluate.vector_kinds.
     """
     vec_dir = run_dir(cfg.out, cfg.run_name, cfg.model)
-    out = freegen_vector_paths(cfg, slugs)
+    out = {}
     for slug in slugs:
         path = vector_file(vec_dir, slug, cfg.layer)
         if not path.exists():
             raise SystemExit(f"freegen: trained vector {path} missing")
         trained = torch.load(path)["dir"]
-        vecs = {"trained": trained, "source_full": full_source_vector(source_dir(cfg), slug, cfg.layer),
-                "trained_random": random_control(trained, RANDOM_CONTROL_SEED + cfg.layer)}
+        out[slug] = {"trained": trained, "source_full": full_source_vector(source_dir(cfg), slug, cfg.layer),
+                     "trained_random": random_control(trained, RANDOM_CONTROL_SEED + cfg.layer)}
+    return out
+
+
+def write_freegen_vectors(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[str, Path]]:
+    """run_root/freegen_vectors/{slug}_{kind}.pt = {"dir": vector} (freegen_vectors) for the three free-gen kinds;
+    absolute paths."""
+    out = freegen_vector_paths(cfg, slugs)
+    for slug, vecs in freegen_vectors(cfg, slugs).items():
         for kind in FREE_GEN_KINDS:
             save_pt(out[slug][kind], {"dir": vecs[kind].detach().cpu().clone()})
     return out

@@ -22,6 +22,11 @@ PersVecFast (extracted responses and activations) and imports its `persvecfast` 
 - `freegen --out O --run-name R` - free generation of a finished run on vLLM (unsteered, and per trait trained /
   source_full / trained_random at c = +-1): fills eval.json's `free_gen` block and recomputes the pass rule;
   resumes from its saved answers, `--fresh`, `--rescore-only` (below)
+- `kldepth --out O --run-name R` - diagnostic, after `freegen`: KL(unsteered || steered) by answer position
+  (tokens 0-512, 512-2048, 2048-4096, 4096-8192) on the run's saved unsteered free answers, teacher-forced, per
+  trait x trained / source_full / trained_random x c = +-1, plus the paired source_full - trained per bucket.
+  Shows whether the 512-token KL term (training's window) also covers the long answers. Writes
+  `trained/<run>/kl_depth.json` only; `--max-tokens` (8192), `--n`, `--traits`
 - `report --out O --runs R1 R2 ...` - one pass/fail table over runs and traits, and the run that passes the most
   traits (tie: larger mean trained margin at c = +-1), or "no run passes"
 
@@ -129,6 +134,10 @@ Re-parse the saved answers without generating (no model, no vLLM, no GPU: run it
 
     python -m persvectrain freegen --out /scratch/inf0/user/nzukowsk/PersVecFast/out --run-name solo_kl1 \
         --rescore-only
+
+KL by answer position (`kldepth`, HF on one GPU, after `freegen`):
+
+    sbatch slurm/train.sbatch kldepth --out /scratch/inf0/user/nzukowsk/PersVecFast/out --run-name solo_kl1
 
 `report` shows a pending run's traits as PENDING, or `PENDING (FAIL: <checks>)` when a teacher-forced check
 already fails (free generation cannot make it pass); a pending run is never picked.

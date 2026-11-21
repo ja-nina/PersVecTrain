@@ -1,4 +1,4 @@
-"""Command line: `python -m persvectrain {check, reference, train, eval, freegen, report} ...`."""
+"""Command line: `python -m persvectrain {check, reference, train, eval, freegen, kldepth, report} ...`."""
 from __future__ import annotations
 
 import argparse
@@ -268,6 +268,23 @@ def cmd_freegen(args) -> int:
     return 0 if res is not None else 1
 
 
+# ---------------------------------------------------------------- kldepth
+
+
+def cmd_kldepth(args) -> int:
+    from persvectrain.kldepth import run_kldepth
+
+    meta_path = run_root(Path(args.out), args.run_name) / "train.json"
+    if not meta_path.exists():
+        print(f"kldepth: {meta_path} missing; run `train` first", flush=True)
+        return 1
+    model_key = read_json(meta_path)["config"]["model"]
+    model, tok = load_model(model_key)
+    res = run_kldepth(model, tok, Path(args.out), args.run_name, max_tokens=args.max_tokens, n_items=args.n,
+                      traits=[slugify(t) for t in args.traits] if args.traits else None, pool=Path(args.pool))
+    return 0 if res is not None else 1
+
+
 # ---------------------------------------------------------------- report
 
 
@@ -354,6 +371,16 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--rescore-only", action="store_true", dest="rescore_only",
                    help="no engine: re-parse the saved answers and rewrite eval.json's free-gen parts")
     p.set_defaults(func=cmd_freegen)
+
+    p = sub.add_parser("kldepth", help="diagnostic: KL by answer position (0-512, 512-2048, ...) on the run's "
+                                       "saved unsteered free answers; writes kl_depth.json only")
+    p.add_argument("--out", required=True, help="out root holding trained/<run_name>")
+    p.add_argument("--run-name", required=True, dest="run_name")
+    p.add_argument("--max-tokens", type=int, default=8192, help="answer tokens read per answer (default 8192)")
+    p.add_argument("--n", type=int, default=None, help="first n held answers only (default all)")
+    p.add_argument("--traits", nargs="+", default=None, help="display names (default all of the run's)")
+    p.add_argument("--pool", default=str(POOL), help="the SuperGPQA pool file")
+    p.set_defaults(func=cmd_kldepth)
 
     p = sub.add_parser("report", help="pass/fail table over runs and the best run")
     p.add_argument("--out", required=True, help="out root holding trained/<run>/eval.json")
