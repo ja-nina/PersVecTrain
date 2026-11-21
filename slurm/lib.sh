@@ -15,11 +15,15 @@ pvt_setup_env() {
   trap 'rm -rf "$MIA_APERTURE_DIR" "$PVF_MIA_DIR"' EXIT
 }
 
-# pvt_arg_value FLAG ARGS...: prints the value following the first FLAG in ARGS (`--flag value`);
+# pvt_arg_value FLAG ARGS...: prints the value following the first FLAG in ARGS (`--flag value` or `--flag=value`);
 # error (status 1, message on stderr) when FLAG is missing or has no value.
 pvt_arg_value() {
   local flag="$1"; shift
   while [ "$#" -gt 0 ]; do
+    if [[ "$1" == "$flag="* ]]; then
+      printf '%s' "${1#"$flag="}"
+      return 0
+    fi
     if [ "$1" = "$flag" ]; then
       [ "$#" -ge 2 ] || { echo "$flag has no value" >&2; return 1; }
       printf '%s' "$2"

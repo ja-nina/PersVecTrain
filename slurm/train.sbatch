@@ -11,7 +11,9 @@
 # For train followed by freegen in one job use slurm/run.sbatch. Run `mkdir -p slurm-logs` first.
 set -euo pipefail
 mkdir -p slurm-logs  # too late for this job's own log: create it before sbatch (README, sweep.sh)
-source "${PVT_LIB:-${SLURM_SUBMIT_DIR:-$PWD}/slurm/lib.sh}"  # sbatch copies this script: find lib.sh via the submit dir
+LIB="${PVT_LIB:-${SLURM_SUBMIT_DIR:-$PWD}/slurm/lib.sh}"
+[ -f "$LIB" ] || { echo "submit from the PersVecTrain root or set PVT_LIB" >&2; exit 1; }
+source "$LIB"  # sbatch copies this script: find lib.sh via the submit dir
 pvt_setup_env
 echo "$(date)  $(hostname)  python=$PYTHON"
 "$PYTHON" -m persvectrain "$@"

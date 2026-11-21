@@ -61,11 +61,15 @@ before the job starts, so the log dir must exist):
 Reference answers for the 260-question pool (the KL term's reference; the sweep's own `reference` job then finds
 them and skips):
 
-    REF=$(sbatch --parsable slurm/train.sbatch reference --model qwen3.5-2b         --out /scratch/inf0/user/nzukowsk/PersVecFast/out)
+    REF=$(sbatch --parsable slurm/train.sbatch reference --model qwen3.5-2b \
+        --out /scratch/inf0/user/nzukowsk/PersVecFast/out)
 
 Timing job: one trait, one epoch, free generation on, after the reference job:
 
-    sbatch --dependency=afterok:$REF slurm/run.sbatch --model qwen3.5-2b --layer 12 --mode solo         --traits Assertive --epochs 1 --beta 0.01 --run-name timing_vllm         --source /scratch/inf0/user/nzukowsk/PersVecFast/out         --out /scratch/inf0/user/nzukowsk/PersVecFast/out
+    sbatch --dependency=afterok:$REF slurm/run.sbatch --model qwen3.5-2b --layer 12 --mode solo \
+        --traits Assertive --epochs 1 --beta 0.01 --run-name timing_vllm \
+        --source /scratch/inf0/user/nzukowsk/PersVecFast/out \
+        --out /scratch/inf0/user/nzukowsk/PersVecFast/out
 
 Reading it (job log `slurm-logs/pvt-<job>.out`, and `trained/timing_vllm/eval.json`):
 
@@ -87,12 +91,17 @@ to every train's arguments:
 
 It prints the job ids and the report command. Report, once all four have finished:
 
-    python -m persvectrain report --out /scratch/inf0/user/nzukowsk/PersVecFast/out         --runs solo_kl0 solo_kl0.1 solo_kl1 solo_kl10
+    python -m persvectrain report --out /scratch/inf0/user/nzukowsk/PersVecFast/out \
+        --runs solo_kl0 solo_kl0.1 solo_kl1 solo_kl10
 
 Joint run at the picked lambda_kl (the value in the picked run's name, e.g. `solo_kl1` gives `KL=1`):
 
     KL=1
-    sbatch slurm/run.sbatch --model qwen3.5-2b --layer 12 --mode joint --beta 0.01 --lambda-o 1 --lambda-kl $KL         --traits Assertive Sycophantic Opportunistic Empathy Evil Sarcastic Agreeableness         --run-name joint_kl$KL         --source /scratch/inf0/user/nzukowsk/PersVecFast/out         --out /scratch/inf0/user/nzukowsk/PersVecFast/out
+    sbatch slurm/run.sbatch --model qwen3.5-2b --layer 12 --mode joint --beta 0.01 --lambda-o 1 --lambda-kl $KL \
+        --traits Assertive Sycophantic Opportunistic Empathy Evil Sarcastic Agreeableness \
+        --run-name joint_kl$KL \
+        --source /scratch/inf0/user/nzukowsk/PersVecFast/out \
+        --out /scratch/inf0/user/nzukowsk/PersVecFast/out
 
 `freegen` alone (an existing run whose status is `pending`, e.g. after a failed free generation) runs through the generic runner, which sets the same vLLM environment:
 

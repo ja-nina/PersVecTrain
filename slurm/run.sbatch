@@ -12,7 +12,9 @@
 # GPU memory is freed first. With --no-free-gen in the arguments only train runs. Run `mkdir -p slurm-logs` first.
 set -euo pipefail
 mkdir -p slurm-logs
-source "${PVT_LIB:-${SLURM_SUBMIT_DIR:-$PWD}/slurm/lib.sh}"  # sbatch copies this script: find lib.sh via the submit dir
+LIB="${PVT_LIB:-${SLURM_SUBMIT_DIR:-$PWD}/slurm/lib.sh}"
+[ -f "$LIB" ] || { echo "submit from the PersVecTrain root or set PVT_LIB" >&2; exit 1; }
+source "$LIB"  # sbatch copies this script: find lib.sh via the submit dir
 OUT="$(pvt_arg_value --out "$@")"
 RUN_NAME="$(pvt_arg_value --run-name "$@")"
 pvt_setup_env

@@ -40,3 +40,10 @@ def test_arg_value_missing_is_an_error():
 def test_has_flag():
     assert _bash('source slurm/lib.sh; pvt_has_flag --no-free-gen "$@"', "train", "--no-free-gen").returncode == 0
     assert _bash('source slurm/lib.sh; pvt_has_flag --no-free-gen "$@"', "train", "--out", "o").returncode != 0
+
+
+def test_arg_value_equals_form():
+    r = _bash('source slurm/lib.sh; pvt_arg_value --out "$@"', "train", "--out=/o dir/x", "--run-name=r1")
+    assert r.returncode == 0 and r.stdout == "/o dir/x"
+    r = _bash('source slurm/lib.sh; pvt_arg_value --run-name "$@"', "train", "--out=o", "--run-name=r1")
+    assert r.stdout == "r1"
