@@ -9,10 +9,11 @@ from __future__ import annotations
 import itertools
 import math
 import re
+import time
 
 import torch
 import torch.nn.functional as F
-from persvecfast.extract import random_control
+from persvecfast.extract import RANDOM_CONTROL_SEED, random_control
 from persvecfast.models import MODELS, request_seed
 from persvecfast.prompts import NEUTRAL_SYSTEM_PROMPT, chat_prompt
 from persvecfast.util import log, write_json
@@ -99,12 +100,22 @@ def _paired(te: dict, a: str, b: str, c: str, field: str) -> tuple[float | None,
     return mean_se([x - y for x, y in zip(xa, xb)])
 
 
+def _shift_diff(fg: dict, a: str, b: str, c: str) -> tuple[float | None, float | None]:
+    """Paired mean and SE over prompts of shift_a - shift_b, shift_k = |tokens_k - tokens_unsteered| per prompt."""
+    u, xa, xb = fg["unsteered"]["tokens"], fg[a][c]["tokens"], fg[b][c]["tokens"]
+    if not len(u) == len(xa) == len(xb):
+        raise ValueError(f"free-gen tokens of {a} / {b} at {c} are not paired with unsteered "
+                         f"({len(xa)} / {len(xb)} vs {len(u)} prompts)")
+    return mean_se([abs(ta - tu) - abs(tb - tu) for ta, tb, tu in zip(xa, xb, u)])
+
+
 def pass_rule(trait_eval: dict) -> dict:
     """The strict pass rule at c = +1 and c = -1 (spec). Differences within 1 SE (paired) count as ties.
 
-    persona: mean(trained - source_full margin) >= -SE; kl: mean(source_full - trained KL) > SE (a tie fails);
-    length: |trained - unsteered| <= |source_full - unsteered| mean tokens; random: mean(trained_random -
-    trained KL) >= -SE and |trained - unsteered| <= |trained_random - unsteered| tokens. Without free
+    persona: mean(trained - source_full margin) >= -SE; kl: mean(source_full - trained KL) > SE (a tie fails
+    "less"); length, per prompt shift_k = |tokens_k - tokens_unsteered| (free answers are paired: one seed per c
+    for every kind): mean(shift_source - shift_trained) > SE (a tie fails "less"); random: mean(trained_random -
+    trained KL) >= -SE and mean(shift_random - shift_trained) >= -SE (a tie passes "no worse"). Without free
     generation the length parts are skipped (named in "skipped"). Accuracy is reported, not checked.
     """
     fg = trait_eval.get("free_gen")
@@ -120,10 +131,10 @@ def pass_rule(trait_eval: dict) -> dict:
         m, se = _paired(trait_eval, "trained_random", "trained", c, "kls")
         rnd = {"kl_passed": m is not None and m >= -(se or 0.0), "kl_diff_mean": m, "kl_diff_se": se}
         if fg:
-            u = fg["unsteered"]["mean_tokens"]
-            t, s, r = (fg[k][c]["mean_tokens"] for k in ("trained", "source_full", "trained_random"))
-            ch["length"] = {"passed": abs(t - u) <= abs(s - u), "trained_shift": t - u, "source_shift": s - u}
-            rnd.update(length_passed=abs(t - u) <= abs(r - u), trained_shift=t - u, random_shift=r - u)
+            m, se = _shift_diff(fg, "source_full", "trained", c)
+            ch["length"] = {"passed": m is not None and m > (se or 0.0), "diff_mean": m, "diff_se": se}
+            m, se = _shift_diff(fg, "trained_random", "trained", c)
+            rnd.update(length_passed=m is not None and m >= -(se or 0.0), length_diff_mean=m, length_diff_se=se)
         else:
             skipped += [f"length@{c}", f"random-length@{c}"]
         rnd["passed"] = rnd["kl_passed"] and rnd.get("length_passed", True)
@@ -145,8 +156,9 @@ def vector_kinds(cfg: TrainConfig, td: TraitData, trained: Tensor) -> dict[str, 
         "source_full": src,
         "source_train": td.start.detach().float().cpu(),
         "source_at_trained_norm": src * (v.norm() / src.norm()),
-        "trained_random": random_control(v, cfg.seed + cfg.layer).float(),
-        "source_random": random_control(src, cfg.seed + cfg.layer).float(),
+        # twins at seed RANDOM_CONTROL_SEED + layer whatever cfg.seed is, as PersVecFast / MA_Environments
+        "trained_random": random_control(v, RANDOM_CONTROL_SEED + cfg.layer).float(),
+        "source_random": random_control(src, RANDOM_CONTROL_SEED + cfg.layer).float(),
     }
 
 
@@ -156,23 +168,25 @@ def _held_cache(model, tok, cfg: TrainConfig, pairs) -> list[tuple[tuple, tuple[
     for p in pairs:
         enc = encode(tok, p.question, p.pos, cfg.max_answer_tokens) + encode(tok, p.question, p.neg,
                                                                               cfg.max_answer_tokens)
-        out.append((enc, _pair_logprobs(model, cfg.layer, None, enc)))
+        out.append((enc, _pair_logprobs(model, cfg, None, enc)))
     return out
 
 
-def _pair_logprobs(model, layer: int, vec: Tensor | None, enc: tuple) -> tuple[Tensor, Tensor]:
+def _pair_logprobs(model, cfg: TrainConfig, vec: Tensor | None, enc: tuple) -> tuple[Tensor, Tensor]:
+    """(pos, neg) answer log-probs steered by vec, normalised as in training (cfg.logprob_norm)."""
     ids_p, s_p, ids_n, s_n = enc
-    with steer(model, layer, vec):
-        return answer_logprob(model, ids_p, s_p), answer_logprob(model, ids_n, s_n)
+    with steer(model, cfg.layer, vec):
+        return (answer_logprob(model, ids_p, s_p, cfg.logprob_norm),
+                answer_logprob(model, ids_n, s_n, cfg.logprob_norm))
 
 
-def _margin(model, layer: int, vec: Tensor, sign: int, enc: tuple, ref: tuple[Tensor, Tensor]) -> float:
-    lpc = _pair_logprobs(model, layer, vec, enc)
+def _margin(model, cfg: TrainConfig, vec: Tensor, sign: int, enc: tuple, ref: tuple[Tensor, Tensor]) -> float:
+    lpc = _pair_logprobs(model, cfg, vec, enc)
     return float(persona_margin(lpc[0], ref[0], lpc[1], ref[1], sign))
 
 
 def _margins(model, cfg: TrainConfig, held: list, vecs: dict[str, Tensor]) -> dict[str, dict[str, list[float]]]:
-    return {kind: {c_key(c): [_margin(model, cfg.layer, c * v, 1 if c > 0 else -1, enc, lp0) for enc, lp0 in held]
+    return {kind: {c_key(c): [_margin(model, cfg, c * v, 1 if c > 0 else -1, enc, lp0) for enc, lp0 in held]
                    for c in C_VALUES}
             for kind, v in vecs.items()}
 
@@ -209,7 +223,7 @@ def _joint(model, cfg: TrainConfig, slugs: list[str], vecs: dict, held: dict, tr
             for s, other in ((a, b), (b, a)):
                 other_vec = w[other] * vecs[other]["trained"]
                 sign = 1 if w[s] > 0 else -1
-                ms = [_margin(model, cfg.layer, mix_vec, sign, enc, _pair_logprobs(model, cfg.layer, other_vec, enc))
+                ms = [_margin(model, cfg, mix_vec, sign, enc, _pair_logprobs(model, cfg, other_vec, enc))
                       for enc, _lp0 in held[s]]
                 mix_m[s], mix_se[s] = mean_se(ms)
                 alone[s] = traits_out[s]["kinds"]["trained"][c_key(float(w[s]))]["margin_mean"]
@@ -224,7 +238,12 @@ def _joint(model, cfg: TrainConfig, slugs: list[str], vecs: dict, held: dict, tr
 def evaluate(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], trained: dict[str, Tensor],
              kl_held: list[RefAnswer], free_gen: bool = True, free_gen_tokens: int = 4096,
              free_gen_batch: int = 20) -> dict:
-    """Evaluate every trained vector on held-out data; writes eval.json in the run root and prints the table."""
+    """Evaluate every trained vector on held-out data; writes eval.json in the run root and prints the table.
+
+    eval.json is written twice when free generation is on: once after the teacher-forced part (free_gen status
+    "pending", the pass rule with its length checks skipped), so a job killed during free generation keeps it,
+    then again once free generation is done (status "done"). `timing` holds the seconds of each part.
+    """
     model.requires_grad_(False)
     model.eval()
     slugs = [s for s in cfg.traits if s in trained]
@@ -232,9 +251,16 @@ def evaluate(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], trained
     sampling, note = model_sampling(cfg.model)
     res: dict = {"run_name": cfg.run_name, "model": cfg.model, "layer": cfg.layer, "mode": cfg.mode,
                  "c_values": list(C_VALUES), "kinds": list(KINDS), "n_kl_held": len(kl_held),
-                 "free_gen": {"enabled": bool(free_gen), "max_new_tokens": free_gen_tokens,
-                              "batch_size": free_gen_batch, "sampling": sampling, "note": note},
+                 "logprob_norm": cfg.logprob_norm,
+                 "free_gen": {"enabled": bool(free_gen), "status": "pending" if free_gen else "disabled",
+                              "max_new_tokens": free_gen_tokens, "batch_size": free_gen_batch,
+                              "sampling": sampling, "note": note},
+                 "timing": {"teacher_forced_s": None, "free_gen_s": None},
                  "traits": {}}
+    path = run_root(cfg.out, cfg.run_name) / "eval.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    t0 = time.monotonic()
+    log("eval: teacher-forced part starts")
     with torch.no_grad():
         held = {s: _held_cache(model, tok, cfg, traits[s].held) for s in slugs}
         log(f"eval: margins on {[len(held[s]) for s in slugs]} held pairs, KL on {len(kl_held)} reference answers")
@@ -256,8 +282,18 @@ def evaluate(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], trained
                 "kinds": kinds,
             }
 
+    if cfg.mode == "joint" and len(slugs) >= 2:
+        with torch.no_grad():
+            res["joint"] = _joint(model, cfg, slugs, vecs, held, res["traits"])
+    _apply_pass(res, slugs)
+    res["timing"]["teacher_forced_s"] = round(time.monotonic() - t0, 2)
+    write_json(path, res)
+    log(f"eval: teacher-forced part done in {res['timing']['teacher_forced_s']} s; wrote {path}"
+        + (" (free generation pending)" if free_gen else ""))
+
     if free_gen:
-        log(f"eval: free generation, {len(kl_held)} prompts, {free_gen_tokens} new tokens; {note}")
+        t1 = time.monotonic()
+        log(f"eval: free generation starts, {len(kl_held)} prompts, {free_gen_tokens} new tokens; {note}")
         kw = dict(layer=cfg.layer, max_new_tokens=free_gen_tokens, batch_size=free_gen_batch, sampling=sampling)
         unsteered = free_generation(model, tok, None, kl_held, request_seed(cfg.seed, "freegen", "unsteered", 0),
                                     **kw)
@@ -265,24 +301,25 @@ def evaluate(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], trained
         for s in slugs:
             fg = {"unsteered": unsteered}
             for kind in FREE_GEN_KINDS:
+                # one seed per c for every kind (and every trait): the answers are paired across kinds
                 fg[kind] = {c_key(c): free_generation(model, tok, c * vecs[s][kind], kl_held,
-                                                      request_seed(cfg.seed, "freegen", kind, c), **kw)
+                                                      request_seed(cfg.seed, "freegen", c), **kw)
                             for c in FREE_GEN_C}
             res["traits"][s]["free_gen"] = fg
+        _apply_pass(res, slugs)
+        res["free_gen"]["status"] = "done"
+        res["timing"]["free_gen_s"] = round(time.monotonic() - t1, 2)
+        write_json(path, res)
+        log(f"eval: free generation done in {res['timing']['free_gen_s']} s; wrote {path}")
 
+    print_table(res)
+    return res
+
+
+def _apply_pass(res: dict, slugs: list[str]) -> None:
     for s in slugs:
         res["traits"][s]["pass"] = pass_rule(res["traits"][s])
-    if cfg.mode == "joint" and len(slugs) >= 2:
-        with torch.no_grad():
-            res["joint"] = _joint(model, cfg, slugs, vecs, held, res["traits"])
     res["summary"] = {s: res["traits"][s]["pass"]["passed"] for s in slugs}
-
-    path = run_root(cfg.out, cfg.run_name) / "eval.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_json(path, res)
-    print_table(res)
-    log(f"eval: wrote {path}")
-    return res
 
 
 # ---------------------------------------------------------------- table
