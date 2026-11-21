@@ -1,4 +1,4 @@
-"""Command line: `python -m persvectrain {check, reference, train} ...`."""
+"""Command line: `python -m persvectrain {check, reference, train, eval} ...`."""
 from __future__ import annotations
 
 import argparse
@@ -10,13 +10,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from persvecfast.extract import vector_file
 from persvecfast.models import MODELS, request_seed
 from persvecfast.prompts import NEUTRAL_SYSTEM_PROMPT, chat_prompt
-from persvecfast.util import log, slugify, write_json
+from persvecfast.util import log, read_json, slugify, write_json
 
 from persvectrain import data as data_mod
 from persvectrain.data import full_source_vector, load_pairs, start_vector, supergpqa_prompts, usable_traits
-from persvectrain.output import (REPO, build_train_json, prepare_run, run_root, source_dir, write_vectors)
+from persvectrain.evaluate import evaluate
+from persvectrain.generate import generate as _generate
+from persvectrain.output import (REPO, build_train_json, prepare_run, run_dir, run_root, source_dir,
+                                 write_vectors)
 from persvectrain.steering import layer_type
 from persvectrain.train import RefAnswer, TrainConfig, TraitData, train
 
@@ -53,24 +57,6 @@ def cmd_check(args) -> int:
 
 
 # ---------------------------------------------------------------- reference
-
-
-@torch.no_grad()
-def _generate(model, tok, prompts: list[str], batch_size: int, max_new_tokens: int, **sampling) -> list[str]:
-    """Batched HF sampling with left padding; returns the decoded continuations (special tokens dropped)."""
-    tok.padding_side = "left"
-    if tok.pad_token_id is None:
-        tok.pad_token = tok.eos_token
-    outs: list[str] = []
-    for i in range(0, len(prompts), batch_size):
-        batch = tok(prompts[i:i + batch_size], return_tensors="pt", padding=True, add_special_tokens=False)
-        batch = {k: v.to(model.device) for k, v in batch.items()}
-        gen = model.generate(**batch, do_sample=True, max_new_tokens=max_new_tokens,
-                             pad_token_id=tok.pad_token_id, **sampling)
-        new = gen[:, batch["input_ids"].shape[1]:]
-        outs.extend(tok.batch_decode(new, skip_special_tokens=True))
-        log(f"reference: {len(outs)}/{len(prompts)} answers")
-    return outs
 
 
 def _write_jsonl_atomic(path: Path, rows: list[dict]) -> None:
@@ -182,10 +168,65 @@ def cmd_train(args) -> int:
 
     for slug in kept:
         write_vectors(vec_dir, slug, cfg.layer, vectors[slug], src, cfg.run_name, seed=cfg.seed)
+    # evaluate the vectors as saved (cast to the source dtype), as `eval` on this run would
+    evaluate(model, tok, cfg, traits, load_trained(vec_dir, kept, cfg.layer), ref_held,
+             free_gen=not args.no_free_gen, free_gen_tokens=args.free_gen_tokens)
     meta.update(finished=True, ended=_now())
     write_json(root / "train.json", meta)
     log(f"train {cfg.run_name}: wrote {root}")
     return 0
+
+
+# ---------------------------------------------------------------- eval
+
+
+def load_trained(vec_dir: Path, slugs: list[str], layer: int) -> dict[str, torch.Tensor]:
+    """The run's trained vectors from vllm_hook/{slug}_L{layer}.pt, as fp32."""
+    out = {}
+    for slug in slugs:
+        path = vector_file(vec_dir, slug, layer)
+        if not path.exists():
+            raise SystemExit(f"trained vector {path} missing: training did not finish writing {slug}")
+        out[slug] = torch.load(path)["dir"].float()
+    return out
+
+
+def cmd_eval(args) -> int:
+    """Re-run the evaluation of an existing run from its train.json (config + splits); writes eval.json only."""
+    root = run_root(Path(args.out), args.run_name)
+    if not (root / "train.json").exists():
+        raise SystemExit(f"no run at {root} (train.json missing)")
+    meta = read_json(root / "train.json")
+    kw = dict(meta["config"])
+    kw["source"], kw["out"] = Path(kw["source"]), Path(args.out)
+    cfg = TrainConfig(**kw)
+    src = source_dir(cfg)
+    splits = meta["splits"]
+
+    traits: dict[str, TraitData] = {}
+    for slug in cfg.traits:
+        by_index = {p.index: p for p in load_pairs(src, slug)}
+        tr = [by_index[i] for i in splits[slug]["train"]]
+        held = [by_index[i] for i in splits[slug]["held"]]
+        traits[slug] = TraitData(slug=slug, train=tr, held=held,
+                                 start=start_vector(src, slug, cfg.layer, splits[slug]["train"]),
+                                 source=full_source_vector(src, slug, cfg.layer))
+    ref_file = Path(meta["sources"].get("reference") or reference_path(cfg.out, cfg.model))
+    refs = {r.id: r for r in load_reference(ref_file)}
+    ref_held = [refs[i] for i in splits["reference"]["held"]]
+    trained = load_trained(run_dir(cfg.out, cfg.run_name, cfg.model), cfg.traits, cfg.layer)
+
+    model, tok = load_model(cfg.model)
+    log(f"eval {cfg.run_name}: traits {cfg.traits}, layer {cfg.layer}")
+    evaluate(model, tok, cfg, traits, trained, ref_held, free_gen=not args.no_free_gen,
+             free_gen_tokens=args.free_gen_tokens)
+    return 0
+
+
+def _add_eval_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--no-free-gen", action="store_true",
+                   help="skip free generation (the pass rule then skips its length checks)")
+    p.add_argument("--free-gen-tokens", type=int, default=4096, help="max new tokens per free answer")
 
 
 # ---------------------------------------------------------------- parser
@@ -233,7 +274,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("train", help="train steering vectors")
     _add_train_flags(p)
+    _add_eval_flags(p)
     p.set_defaults(func=cmd_train)
+
+    p = sub.add_parser("eval", help="re-run the evaluation of an existing run (overwrites its eval.json only)")
+    p.add_argument("--out", required=True, help="out root holding trained/<run_name>")
+    p.add_argument("--run-name", required=True, dest="run_name")
+    _add_eval_flags(p)
+    p.set_defaults(func=cmd_eval)
     return parser
 
 

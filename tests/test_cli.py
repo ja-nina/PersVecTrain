@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from persvectrain import cli
+from persvectrain import evaluate as ev
 from tests.conftest import CharTokenizer, make_tiny_model
 
 MODEL = "qwen3.5-2b"
@@ -51,7 +52,12 @@ def tiny(monkeypatch):
         calls.append(key)
         return make_tiny_model(), CharTokenizer()
 
+    def fake_generate(model, tok, prompts, batch_size, max_new_tokens, **kw):
+        calls.append(f"generate {max_new_tokens}")
+        return ["so the answer is C"] * len(prompts), [7] * len(prompts)
+
     monkeypatch.setattr(cli, "load_model", fake_load)
+    monkeypatch.setattr(ev, "generate_counted", fake_generate)
     return calls
 
 
@@ -99,7 +105,78 @@ def test_cli_train_end_to_end_tiny(tiny, out_root, capsys):
 
     trained = torch.load(d / "vllm_hook" / "assertive_L1.pt")["dir"]
     assert torch.equal(torch.load(d / "assertive.pt")[1], trained)
-    assert "evil" in capsys.readouterr().out
+
+    e = json.loads((root / "eval.json").read_text(encoding="utf-8"))
+    t = e["traits"]["assertive"]
+    assert len(t["kinds"]["trained"]["c=+1"]["margins"]) == 4 and len(t["kinds"]["trained"]["c=+1"]["kls"]) == 2
+    assert t["free_gen"]["unsteered"]["accuracy"] == 1.0 and t["free_gen"]["trained"]["c=-1"]["mean_tokens"] == 7
+    assert e["free_gen"]["max_new_tokens"] == 4096 and tiny.count("generate 4096") == 7
+    assert e["summary"] == {"assertive": t["pass"]["passed"]}
+    assert t["norms"]["trained"] == pytest.approx(float(trained.float().norm()))
+    out = capsys.readouterr().out
+    assert "evil" in out and "pass assertive:" in out
+
+
+def test_cli_train_no_free_gen_and_tokens(tiny, out_root):
+    _fake_reference(out_root)
+    assert cli.main(_train_args(out_root, "--no-free-gen")) == 0
+    e = json.loads((out_root / "trained" / "run1" / "eval.json").read_text(encoding="utf-8"))
+    assert e["free_gen"]["enabled"] is False and not [c for c in tiny if c.startswith("generate")]
+    assert "length@c=+1" in e["traits"]["assertive"]["pass"]["skipped"]
+
+    args = _train_args(out_root, "--free-gen-tokens", "32")
+    args[args.index("run1")] = "run2"
+    assert cli.main(args) == 0
+    e = json.loads((out_root / "trained" / "run2" / "eval.json").read_text(encoding="utf-8"))
+    assert e["free_gen"]["max_new_tokens"] == 32 and "generate 32" in tiny
+
+
+def test_cli_train_eval_crash_leaves_unfinished(tiny, out_root, monkeypatch):
+    _fake_reference(out_root)
+
+    def boom(*a, **kw):
+        raise RuntimeError("eval died")
+
+    monkeypatch.setattr(cli, "evaluate", boom)
+    with pytest.raises(RuntimeError):
+        cli.main(_train_args(out_root))
+    root = out_root / "trained" / "run1"
+    assert json.loads((root / "train.json").read_text(encoding="utf-8"))["finished"] is False
+    assert (root / "persona" / MODEL / "bf16" / "assertive.pt").exists()
+
+
+def test_cli_eval_reruns_on_existing_run(tiny, out_root, monkeypatch):
+    _fake_reference(out_root)
+    assert cli.main(_train_args(out_root, "--no-free-gen")) == 0
+    root = out_root / "trained" / "run1"
+    first = json.loads((root / "eval.json").read_text(encoding="utf-8"))
+    train_json = (root / "train.json").read_text(encoding="utf-8")
+    (root / "eval.json").unlink()
+
+    seen = {}
+    real = ev.evaluate
+
+    def spy(model, tok, cfg, traits, trained, kl_held, **kw):
+        seen.update(cfg=cfg, traits=traits, kl_held=kl_held, kw=kw)
+        return real(model, tok, cfg, traits, trained, kl_held, **kw)
+
+    monkeypatch.setattr(cli, "evaluate", spy)
+    assert cli.main(["eval", "--out", str(out_root), "--run-name", "run1", "--no-free-gen"]) == 0
+    again = json.loads((root / "eval.json").read_text(encoding="utf-8"))
+    assert again["traits"]["assertive"]["kinds"] == first["traits"]["assertive"]["kinds"]
+    assert (root / "train.json").read_text(encoding="utf-8") == train_json
+    tj = json.loads(train_json)
+    td = seen["traits"]["assertive"]
+    assert [p.index for p in td.held] == tj["splits"]["assertive"]["held"]
+    assert [p.index for p in td.train] == tj["splits"]["assertive"]["train"]
+    assert [r.id for r in seen["kl_held"]] == tj["splits"]["reference"]["held"]
+    assert seen["cfg"].layer == 1 and seen["cfg"].traits == ["assertive"]
+    assert seen["kw"] == {"free_gen": False, "free_gen_tokens": 4096}
+
+
+def test_cli_eval_missing_run(tiny, out_root):
+    with pytest.raises(SystemExit):
+        cli.main(["eval", "--out", str(out_root), "--run-name", "nope"])
 
 
 def test_cli_train_refuses_existing_run(tiny, out_root):
