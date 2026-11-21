@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import gzip
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -256,7 +257,7 @@ def test_rerun_overwrites_only_the_free_gen_block(run, monkeypatch):
     vec_bytes = {p: p.read_bytes() for p in run["vec_dir"].rglob("*") if p.is_file()}
 
     engine, _ = _fake(monkeypatch, _reply)
-    _freegen(run)
+    _freegen(run, fresh=True)  # without fresh the saved answers would be reused (resume)
     again = json.loads((run["root"] / "eval.json").read_text(encoding="utf-8"))
     assert again["free_gen"]["status"] == "done" and len(_reqs(engine)) == 39
     assert again["traits"]["calm"]["free_gen"]["trained"]["c=+1"]["tokens"] == [110] * 3
@@ -340,3 +341,169 @@ def test_engine_missing_answers_raises(run, monkeypatch):
     with pytest.raises(RuntimeError):
         _freegen(run)
     assert (run["root"] / "eval.json").read_bytes() == before
+
+
+# ---------------------------------------------------------------- saved answers: resume, --fresh, --rescore-only
+
+
+def _answers(run) -> list[dict]:
+    with gzip.open(run["root"] / fgm.ANSWERS_FILE, "rt", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _small_batches(monkeypatch, size=5):
+    monkeypatch.setitem(fgm.MODELS, MODEL, dataclasses.replace(MODELS[MODEL], batch_size=size))
+
+
+def test_answers_appended_per_chunk(run, monkeypatch):
+    engine, _ = _fake(monkeypatch)
+    _small_batches(monkeypatch)
+    on_disk = []
+    real = engine.generate
+
+    def generate(reqs):
+        path = run["root"] / fgm.ANSWERS_FILE
+        on_disk.append(len(_answers(run)) if path.exists() else 0)
+        return real(reqs)
+
+    engine.generate = generate
+    _freegen(run, max_tokens=64)
+    assert on_disk == [0, 5, 10, 15, 20, 25, 30, 35]  # each chunk is on disk before the next one starts
+    lines = _answers(run)
+    assert len(lines) == 39 and set(lines[0]) == {"key", "text", "n_tokens", "finish_reason", "max_tokens", "seed"}
+    by_key = {r.key: r for r in _reqs(engine)}
+    for ln in lines:
+        r = by_key[tuple(ln["key"])]
+        assert ln["seed"] == r.seed and ln["max_tokens"] == 64 and ln["text"] == "Thinking. ANSWER: C"
+
+
+def _crash_after(engine, n_calls):
+    real, calls = engine.generate, []
+
+    def generate(reqs):
+        if len(calls) == n_calls:
+            raise RuntimeError("job killed")
+        calls.append(1)
+        return real(reqs)
+
+    engine.generate = generate
+
+
+def test_resume_skips_done_requests(run, monkeypatch):
+    _small_batches(monkeypatch)
+    engine, _ = _fake(monkeypatch, _reply)
+    _crash_after(engine, 3)
+    pending = (run["root"] / "eval.json").read_bytes()
+    with pytest.raises(RuntimeError):
+        _freegen(run)
+    assert len(_answers(run)) == 15 and (run["root"] / "eval.json").read_bytes() == pending
+    done = {tuple(ln["key"]) for ln in _answers(run)}
+
+    engine2, _ = _fake(monkeypatch, _reply)
+    ev = _freegen(run)
+    again = {r.key for r in _reqs(engine2)}
+    assert len(again) == 24 and not (again & done)  # only the rest
+    assert ev["free_gen"]["status"] == "done"
+    _fake(monkeypatch, _reply)
+    full = _freegen(run, fresh=True)  # same results as one uninterrupted run
+    assert ev["traits"] == full["traits"] and ev["free_gen"]["unsteered"] == full["free_gen"]["unsteered"]
+
+
+def test_resume_needs_the_same_max_tokens(run, monkeypatch):
+    _fake(monkeypatch)
+    _freegen(run, max_tokens=64)
+    engine, _ = _fake(monkeypatch)
+    ev = _freegen(run, max_tokens=128)
+    assert len(_reqs(engine)) == 39 and ev["free_gen"]["max_tokens"] == 128  # 64-token answers not reused
+    engine, opened = _fake(monkeypatch)
+    _freegen(run, max_tokens=128)
+    assert _reqs(engine) == [] and opened == []  # everything saved: no engine at all
+
+
+def test_fresh_regenerates_everything(run, monkeypatch):
+    _fake(monkeypatch)
+    _freegen(run)
+    engine, _ = _fake(monkeypatch, _reply)
+    ev = _freegen(run, fresh=True)
+    assert len(_reqs(engine)) == 39 and len(_answers(run)) == 39
+    assert ev["traits"]["calm"]["free_gen"]["trained"]["c=+1"]["tokens"] == [110] * 3
+
+
+def _jsonl(lines) -> str:
+    return "".join(json.dumps(ln) + "\n" for ln in lines)
+
+
+@pytest.mark.parametrize("damage", ["truncated_gzip", "bad_json"])
+def test_corrupted_last_line_is_dropped_and_regenerated(run, monkeypatch, damage):
+    _fake(monkeypatch, _reply)
+    first = _freegen(run)
+    path = run["root"] / fgm.ANSWERS_FILE
+    lines = _answers(run)
+    if damage == "truncated_gzip":  # killed while writing the last chunk: its gzip member is cut
+        tail = gzip.compress(_jsonl(lines[-3:]).encode())
+        path.write_bytes(gzip.compress(_jsonl(lines[:-3]).encode()) + tail[:len(tail) // 2])
+    else:  # a half-written last line
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            f.write(_jsonl(lines[:-1]) + json.dumps(lines[-1])[:20])
+    engine, _ = _fake(monkeypatch, _reply)
+    ev = _freegen(run)
+    regen = {r.key for r in _reqs(engine)}
+    assert tuple(lines[-1]["key"]) in regen and len(regen) <= 3
+    assert ev["traits"] == first["traits"]
+    assert sorted(tuple(ln["key"]) for ln in _answers(run)) == sorted(tuple(ln["key"]) for ln in lines)
+
+
+def test_rescore_only_uses_no_engine_and_follows_the_parser(run, monkeypatch):
+    _fake(monkeypatch, _reply)
+    first = _freegen(run, max_tokens=500)
+    train_json = (run["root"] / "train.json").read_bytes()
+
+    @contextmanager
+    def no_engine(spec, kind):
+        raise AssertionError("rescore must not open an engine")
+        yield
+
+    def no_tokenizer(key):
+        raise AssertionError("rescore must not load a tokenizer")
+
+    monkeypatch.setattr(fgm, "default_open_engine", lambda: no_engine)
+    monkeypatch.setattr(fgm, "load_tokenizer", no_tokenizer)
+    monkeypatch.setattr(fgm, "parse_answer", lambda text, n: "A")
+    ev = _freegen(run, rescore_only=True)
+    assert ev["free_gen"]["status"] == "done" and ev["free_gen"]["max_tokens"] == 500  # the saved answers' cap
+    t = ev["traits"]["assertive"]["free_gen"]
+    assert t["trained"]["c=+1"]["answer"] == ["A"] * 3 and t["trained"]["c=+1"]["accuracy"] == 0.0
+    assert t["trained"]["c=+1"]["tokens"] == first["traits"]["assertive"]["free_gen"]["trained"]["c=+1"]["tokens"]
+    assert ev["traits"]["assertive"]["kinds"] == first["traits"]["assertive"]["kinds"]
+    assert ev["timing"]["free_gen_s"] == first["timing"]["free_gen_s"]  # generation time kept
+    assert json.loads((run["root"] / "eval.json").read_text(encoding="utf-8")) == ev
+    assert (run["root"] / "train.json").read_bytes() == train_json
+    assert cli.main(["freegen", "--out", str(run["out"]), "--run-name", "run1", "--pool", str(run["pool"]),
+                     "--rescore-only"]) == 0
+
+
+def test_rescore_only_without_saved_answers(run, monkeypatch, capsys):
+    _, opened = _fake(monkeypatch)
+    before = (run["root"] / "eval.json").read_bytes()
+    assert _freegen(run, rescore_only=True) is None
+    assert fgm.ANSWERS_FILE in capsys.readouterr().out and opened == []
+    assert (run["root"] / "eval.json").read_bytes() == before
+
+
+def test_rescore_only_with_missing_answers_refuses(run, monkeypatch):
+    _fake(monkeypatch)
+    path = run["root"] / fgm.ANSWERS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        f.write(_jsonl([{"key": ["-", "unsteered", 0.0, "s4"], "text": "ANSWER: C", "n_tokens": 3,
+                         "finish_reason": "stop", "max_tokens": fgm.MAX_TOKENS,
+                         "seed": request_seed(0, "freegen", "unsteered", "s4")}]))
+    before = (run["root"] / "eval.json").read_bytes()
+    with pytest.raises(SystemExit):
+        _freegen(run, rescore_only=True)
+    assert (run["root"] / "eval.json").read_bytes() == before
+
+
+def test_cli_fresh_and_rescore_only_exclusive(run):
+    with pytest.raises(SystemExit):
+        cli.main(["freegen", "--out", str(run["out"]), "--run-name", "run1", "--fresh", "--rescore-only"])

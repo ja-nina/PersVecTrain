@@ -9,9 +9,12 @@ tokenizer is loaded here (chat template); vLLM loads the model.
 """
 from __future__ import annotations
 
+import gzip
 import json
+import os
 import re
 import time
+import zlib
 from dataclasses import asdict
 from pathlib import Path
 
@@ -31,6 +34,7 @@ POOL = REPO / "data" / "supergpqa_pool.jsonl"
 MAX_TOKENS = 15360  # the games' max_tokens
 REFERENCE_SUFFIX = "_pool260.jsonl"  # cli.reference_path: the reference answers of the 260-question pool
 UNSTEERED = "unsteered"
+ANSWERS_FILE = "freegen_answers.jsonl.gz"  # in run_root: every saved answer, one gzip member per chunk
 SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty", "presence_penalty")
 
 
@@ -102,15 +106,20 @@ def held_questions(meta: dict, pool: Path) -> tuple[list[RefAnswer], dict[str, i
     return held, {r.id: n_options[r.id] for r in held}
 
 
+def freegen_vector_paths(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[str, Path]]:
+    """{slug: {kind: run_root/freegen_vectors/{slug}_{kind}.pt}}, absolute; nothing written."""
+    d = (run_root(cfg.out, cfg.run_name) / "freegen_vectors").resolve()
+    return {slug: {kind: d / f"{slug}_{kind}.pt" for kind in FREE_GEN_KINDS} for slug in slugs}
+
+
 def write_freegen_vectors(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[str, Path]]:
     """run_root/freegen_vectors/{slug}_{kind}.pt = {"dir": vector} for the three free-gen kinds; absolute paths.
 
     trained: the run's vllm_hook file as saved; source_full: the source's vector at the layer; trained_random:
     random_control(trained, RANDOM_CONTROL_SEED + layer), as write_vectors and evaluate.vector_kinds.
     """
-    d = (run_root(cfg.out, cfg.run_name) / "freegen_vectors").resolve()
     vec_dir = run_dir(cfg.out, cfg.run_name, cfg.model)
-    out: dict[str, dict[str, Path]] = {}
+    out = freegen_vector_paths(cfg, slugs)
     for slug in slugs:
         path = vector_file(vec_dir, slug, cfg.layer)
         if not path.exists():
@@ -118,31 +127,111 @@ def write_freegen_vectors(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[
         trained = torch.load(path)["dir"]
         vecs = {"trained": trained, "source_full": full_source_vector(source_dir(cfg), slug, cfg.layer),
                 "trained_random": random_control(trained, RANDOM_CONTROL_SEED + cfg.layer)}
-        out[slug] = {}
         for kind in FREE_GEN_KINDS:
-            out[slug][kind] = d / f"{slug}_{kind}.pt"
             save_pt(out[slug][kind], {"dir": vecs[kind].detach().cpu().clone()})
     return out
 
 
-def build_requests(cfg: TrainConfig, held: list[RefAnswer], n_options: dict[str, int],
-                   vector_paths: dict[str, dict[str, Path]], tok, max_tokens: int = MAX_TOKENS) -> list[Request]:
-    """Unsteered once per held question, then per trait x kind x c; keys (slug | "-", kind, c, question id).
+def request_plan(cfg: TrainConfig, held: list[RefAnswer], slugs: list[str]) -> list[tuple[tuple, int]]:
+    """(key, seed) of every free-gen request in order: unsteered once per held question, then per trait x kind x c;
+    keys (slug | "-", kind, c, question id).
 
     Seeds: request_seed(cfg.seed, "freegen", c, qid) for every steered kind and trait (paired),
     request_seed(cfg.seed, "freegen", "unsteered", qid) unsteered.
     """
-    prompts = {r.id: chat_prompt(tok, NEUTRAL_SYSTEM_PROMPT, r.question + instruction(n_options[r.id]), False)
-               for r in held}
-    reqs = [Request(("-", UNSTEERED, 0.0, r.id), prompts[r.id],
-                    request_seed(cfg.seed, "freegen", UNSTEERED, r.id), None, max_tokens) for r in held]
-    for slug, paths in vector_paths.items():
+    plan = [(("-", UNSTEERED, 0.0, r.id), request_seed(cfg.seed, "freegen", UNSTEERED, r.id)) for r in held]
+    for slug in slugs:
         for kind in FREE_GEN_KINDS:
             for c in FREE_GEN_C:
-                steer = {"layer": cfg.layer, "coeff": c, "vector_path": str(paths[kind])}
-                reqs += [Request((slug, kind, c, r.id), prompts[r.id], request_seed(cfg.seed, "freegen", c, r.id),
-                                 dict(steer), max_tokens) for r in held]
+                plan += [((slug, kind, c, r.id), request_seed(cfg.seed, "freegen", c, r.id)) for r in held]
+    return plan
+
+
+def build_requests(cfg: TrainConfig, held: list[RefAnswer], n_options: dict[str, int],
+                   vector_paths: dict[str, dict[str, Path]], tok, max_tokens: int = MAX_TOKENS) -> list[Request]:
+    """The requests of request_plan (traits = vector_paths' keys) with their prompts and steering."""
+    prompts = {r.id: chat_prompt(tok, NEUTRAL_SYSTEM_PROMPT, r.question + instruction(n_options[r.id]), False)
+               for r in held}
+    reqs = []
+    for key, seed in request_plan(cfg, held, list(vector_paths)):
+        slug, kind, c, qid = key
+        steer = None if kind == UNSTEERED else \
+            {"layer": cfg.layer, "coeff": c, "vector_path": str(vector_paths[slug][kind])}
+        reqs.append(Request(key, prompts[qid], seed, steer, max_tokens))
     return reqs
+
+
+# ---------------------------------------------------------------- saved answers (run_root/freegen_answers.jsonl.gz)
+
+
+ANSWER_FIELDS = ("key", "text", "n_tokens", "finish_reason", "max_tokens", "seed")
+
+
+def _gunzip_tolerant(data: bytes) -> tuple[bytes, bool]:
+    """Decompress concatenated gzip members (one per appended chunk); (bytes, damaged). A cut or corrupt member
+    ends the read: what it decompressed so far is kept (its last line may be partial, the reader drops it)."""
+    out = []
+    while data:
+        d = zlib.decompressobj(wbits=31)
+        try:
+            out.append(d.decompress(data))
+        except zlib.error:
+            return b"".join(out), True
+        if not d.eof:
+            return b"".join(out), True
+        data = d.unused_data
+    return b"".join(out), False
+
+
+def read_answers(path: Path) -> tuple[list[dict], bool]:
+    """The saved answer lines in file order, and whether the file was damaged (cut gzip member, a line that is
+    not a complete JSON answer); damaged lines are dropped."""
+    if not path.exists():
+        return [], False
+    raw, damaged = _gunzip_tolerant(path.read_bytes())
+    lines = []
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            damaged = True
+            continue
+        if not isinstance(d, dict) or any(k not in d for k in ANSWER_FIELDS):
+            damaged = True
+            continue
+        lines.append(d)
+    return lines, damaged
+
+
+def write_answers(path: Path, lines: list[dict], append: bool = True) -> None:
+    """Append (one gzip member, closed on return) or rewrite the file with these answer lines."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if append:
+        with gzip.open(path, "at", encoding="utf-8") as f:
+            f.write("".join(json.dumps(ln) + "\n" for ln in lines))
+        return
+    tmp = path.with_name(path.name + ".tmp")
+    with gzip.open(tmp, "wt", encoding="utf-8") as f:
+        f.write("".join(json.dumps(ln) + "\n" for ln in lines))
+    os.replace(tmp, path)
+
+
+def answer_line(r: Result, req: Request) -> dict:
+    return {"key": list(req.key), "text": r.text, "n_tokens": int(r.n_tokens), "finish_reason": r.finish_reason,
+            "max_tokens": req.max_tokens, "seed": req.seed}
+
+
+def saved_results(lines: list[dict], plan: list[tuple[tuple, int]], max_tokens: int) -> dict[tuple, Result]:
+    """Results of the plan's requests found in the saved lines (same key, seed and max_tokens; the last line wins)."""
+    seeds = dict(plan)
+    out = {}
+    for ln in lines:
+        key = tuple(ln["key"])
+        if key in seeds and ln["seed"] == seeds[key] and ln["max_tokens"] == max_tokens:
+            out[key] = Result(key, ln["text"], ln["n_tokens"], ln["finish_reason"])
+    return out
 
 
 # ---------------------------------------------------------------- scoring
@@ -176,14 +265,23 @@ def fold(results: dict[tuple, Result], held: list[RefAnswer], n_options: dict[st
 # ---------------------------------------------------------------- run
 
 
-def run_freegen(out: Path, run_name: str, max_tokens: int = MAX_TOKENS, open_engine=None,
-                pool: Path = POOL) -> dict | None:
+def run_freegen(out: Path, run_name: str, max_tokens: int | None = None, open_engine=None,
+                pool: Path = POOL, fresh: bool = False, rescore_only: bool = False) -> dict | None:
     """Free generation for one finished run; returns its updated eval.json, or None (with a message) when the run
     has no train.json / eval.json, did not finish, was trained with --no-free-gen, or has no trait to answer.
 
-    Writes run_root/freegen_vectors/ and the free-gen parts of eval.json only (top-level free_gen, per trait
-    free_gen and pass, summary, timing.free_gen_s); train.json and the run's vectors are never touched.
+    Every engine chunk's answers are appended to run_root/freegen_answers.jsonl.gz (one gzip member per chunk) as
+    soon as it is done; a rerun reuses the saved answers of the same requests (key, seed and max_tokens) and
+    generates only the rest (resume), `fresh` deletes the file first. Scoring always reads the file.
+    `rescore_only`: no engine and no tokenizer, re-parse the saved answers (e.g. after a parser change); every
+    request must have a saved answer; max_tokens None = the cap eval.json records (else MAX_TOKENS).
+
+    Writes run_root/freegen_vectors/, the answers file and the free-gen parts of eval.json only (top-level
+    free_gen, per trait free_gen and pass, summary, timing.free_gen_s; rescore keeps timing.free_gen_s);
+    train.json and the run's vectors are never touched.
     """
+    if fresh and rescore_only:
+        raise ValueError("freegen: fresh and rescore_only exclude each other")
     root = run_root(Path(out), run_name)
     for name in ("train.json", "eval.json"):
         if not (root / name).exists():
@@ -210,29 +308,64 @@ def run_freegen(out: Path, run_name: str, max_tokens: int = MAX_TOKENS, open_eng
     if not slugs:
         print(f"freegen: no trait of {root} to answer; nothing to do", flush=True)
         return None
-    if status == "done":
-        log(f"freegen: {root} already has free-gen results; rerun overwrites them")
+    answers_path = root / ANSWERS_FILE
+    if rescore_only:
+        if not answers_path.exists():
+            print(f"freegen: {answers_path} missing; nothing to rescore (run `freegen` first)", flush=True)
+            return None
+        if max_tokens is None:
+            max_tokens = read_json(root / "eval.json").get("free_gen", {}).get("max_tokens") or MAX_TOKENS
+    else:
+        max_tokens = MAX_TOKENS if max_tokens is None else max_tokens
+        if status == "done":
+            log(f"freegen: {root} already has free-gen results; rerun overwrites them "
+                f"({'regenerating' if fresh else 'saved answers reused'})")
+        if fresh and answers_path.exists():
+            log(f"freegen: --fresh: deleting {answers_path}")
+            answers_path.unlink()
 
     spec = MODELS[cfg.model]
     held, n_options = held_questions(meta, pool)
-    tok = load_tokenizer(cfg.model)
-    paths = write_freegen_vectors(cfg, slugs)
-    reqs = build_requests(cfg, held, n_options, paths, tok, max_tokens)
-    open_engine = open_engine or default_open_engine()
-    log(f"freegen {run_name}: {len(reqs)} requests ({len(held)} questions, traits {slugs}), {max_tokens} new tokens, "
-        f"chunks of {spec.batch_size}")
+    plan = request_plan(cfg, held, slugs)
+    lines, damaged = read_answers(answers_path)
+    if damaged and not rescore_only:
+        # a job killed while writing: drop the damaged tail, so the members appended next are readable
+        log(f"freegen: {answers_path} was damaged (cut or partial line); kept {len(lines)} complete answers")
+        write_answers(answers_path, lines, append=False)
+    done = saved_results(lines, plan, max_tokens)
     t0 = time.monotonic()
-    results: dict[tuple, Result] = {}
-    with open_engine(spec, "steer") as engine:
-        for chunk in chunks(reqs, spec.batch_size):
-            for r in engine.generate(chunk):
-                # only what scoring needs: thousands of 15k-token answers' token ids would fill the RAM
-                results[r.key] = Result(r.key, r.text, r.n_tokens, r.finish_reason)
-            log(f"freegen {run_name}: {len(results)}/{len(reqs)} answers")
-    missing = [r.key for r in reqs if r.key not in results]
-    if missing:
-        raise RuntimeError(f"freegen: the engine returned no answer for {len(missing)} requests, e.g. {missing[0]}")
-    unsteered, per_trait = fold(results, held, n_options, slugs)
+    if rescore_only:
+        missing = [k for k, _ in plan if k not in done]
+        if missing:
+            raise SystemExit(f"freegen --rescore-only: {answers_path} has no {max_tokens}-token answer for "
+                             f"{len(missing)} of {len(plan)} requests, e.g. {missing[0]}; run `freegen` (resumes)")
+        paths = freegen_vector_paths(cfg, slugs)
+        log(f"freegen {run_name}: rescoring {len(plan)} saved answers")
+    else:
+        tok = load_tokenizer(cfg.model)
+        paths = write_freegen_vectors(cfg, slugs)
+        reqs = [r for r in build_requests(cfg, held, n_options, paths, tok, max_tokens) if r.key not in done]
+        log(f"freegen {run_name}: {len(plan)} requests ({len(held)} questions, traits {slugs}), {max_tokens} new "
+            f"tokens, {len(plan) - len(reqs)} saved in {answers_path.name}, {len(reqs)} to generate in chunks of "
+            f"{spec.batch_size}")
+        if reqs:
+            open_engine = open_engine or default_open_engine()
+            n = 0
+            with open_engine(spec, "steer") as engine:
+                for chunk in chunks(reqs, spec.batch_size):
+                    by_key = {r.key: r for r in chunk}
+                    # only what scoring needs goes to disk: thousands of 15k-token answers' token ids would not fit
+                    new = [answer_line(r, by_key[r.key]) for r in engine.generate(chunk) if r.key in by_key]
+                    write_answers(answers_path, new)
+                    n += len(new)
+                    log(f"freegen {run_name}: {len(plan) - len(reqs) + n}/{len(plan)} answers")
+        lines, _ = read_answers(answers_path)
+        done = saved_results(lines, plan, max_tokens)
+        missing = [k for k, _ in plan if k not in done]
+        if missing:
+            raise RuntimeError(f"freegen: the engine returned no answer for {len(missing)} requests, e.g. "
+                               f"{missing[0]}")
+    unsteered, per_trait = fold(done, held, n_options, slugs)
 
     # re-read: eval.json may have been rewritten (`eval`) while vLLM was generating
     ev = read_json(root / "eval.json")
@@ -241,14 +374,20 @@ def run_freegen(out: Path, run_name: str, max_tokens: int = MAX_TOKENS, open_eng
                       "sampling": {k: v for k, v in asdict(spec).items() if k in SAMPLING_FIELDS},
                       "presence_penalty_applied": True, "batch_size": spec.batch_size, "n_held": len(held),
                       "instruction": "End your reply with 'ANSWER: <letter>', one of A, B, ...",
+                      "answers": str(answers_path.resolve()),
                       "vectors": {s: {k: str(p) for k, p in kv.items()} for s, kv in paths.items()},
                       "unsteered": unsteered}
     for s in slugs:
         ev["traits"][s]["free_gen"] = per_trait[s]
     apply_pass(ev, [s for s in ev["traits"]])
-    ev.setdefault("timing", {})["free_gen_s"] = round(time.monotonic() - t0, 2)
+    timing = ev.setdefault("timing", {})
+    if rescore_only:
+        log(f"freegen {run_name}: rescored; wrote {root / 'eval.json'} (timing.free_gen_s kept)")
+    else:
+        # a resumed run: this job's seconds only
+        timing["free_gen_s"] = round(time.monotonic() - t0, 2)
+        log(f"freegen {run_name}: done in {timing['free_gen_s']} s; wrote {root / 'eval.json'}")
     write_json(root / "eval.json", ev)
-    log(f"freegen {run_name}: done in {ev['timing']['free_gen_s']} s; wrote {root / 'eval.json'}")
     print_freegen_table(ev)
     return ev
 

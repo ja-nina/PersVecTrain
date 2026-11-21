@@ -263,7 +263,8 @@ def _add_eval_flags(p: argparse.ArgumentParser) -> None:
 
 
 def cmd_freegen(args) -> int:
-    res = run_freegen(Path(args.out), args.run_name, max_tokens=args.max_tokens, pool=Path(args.pool))
+    res = run_freegen(Path(args.out), args.run_name, max_tokens=args.max_tokens, pool=Path(args.pool),
+                      fresh=args.fresh, rescore_only=args.rescore_only)
     return 0 if res is not None else 1
 
 
@@ -343,8 +344,15 @@ def build_parser() -> argparse.ArgumentParser:
                                        "free_gen block and recomputes the pass rule)")
     p.add_argument("--out", required=True, help="out root holding trained/<run_name>")
     p.add_argument("--run-name", required=True, dest="run_name")
-    p.add_argument("--max-tokens", type=int, default=FREEGEN_MAX_TOKENS, help="max new tokens per answer")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help=f"max new tokens per answer (default {FREEGEN_MAX_TOKENS}; with --rescore-only the cap "
+                        "eval.json records)")
     p.add_argument("--pool", default=str(POOL), help="the SuperGPQA pool file (option counts per question)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--fresh", action="store_true",
+                   help="delete the run's freegen_answers.jsonl.gz first (default: resume, reuse saved answers)")
+    g.add_argument("--rescore-only", action="store_true", dest="rescore_only",
+                   help="no engine: re-parse the saved answers and rewrite eval.json's free-gen parts")
     p.set_defaults(func=cmd_freegen)
 
     p = sub.add_parser("report", help="pass/fail table over runs and the best run")
