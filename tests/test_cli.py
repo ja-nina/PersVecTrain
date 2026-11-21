@@ -45,7 +45,14 @@ def _fake_reference(out: Path, n: int = 10) -> Path:
 
 @pytest.fixture
 def tiny(monkeypatch):
-    monkeypatch.setattr(cli, "load_model", lambda key: (make_tiny_model(), CharTokenizer()))
+    calls: list[str] = []
+
+    def fake_load(key):
+        calls.append(key)
+        return make_tiny_model(), CharTokenizer()
+
+    monkeypatch.setattr(cli, "load_model", fake_load)
+    return calls
 
 
 @pytest.fixture
@@ -80,6 +87,7 @@ def test_cli_train_end_to_end_tiny(tiny, out_root, capsys):
     tj = json.loads((root / "train.json").read_text(encoding="utf-8"))
     assert tj["config"]["traits"] == ["assertive"] and tj["config"]["epochs"] == 1
     assert tj["seed"] == 0 and tj["layer_type"] == "full_attention"
+    assert tj["finished"] is True and tj["started"] and tj["ended"]
     assert set(tj["dropped_traits"]) == {"evil"}
     assert tj["sources"]["reference"] == str(ref)
     assert tj["sources"]["assertive"]["vectors"].endswith("assertive.pt")
@@ -99,6 +107,38 @@ def test_cli_train_refuses_existing_run(tiny, out_root):
     (out_root / "trained" / "run1").mkdir(parents=True)
     with pytest.raises(FileExistsError):
         cli.main(_train_args(out_root))
+    assert tiny == []  # refused before the model is loaded
+    assert list((out_root / "trained" / "run1").iterdir()) == []
+
+
+def test_cli_train_json_written_before_training(tiny, out_root, monkeypatch):
+    _fake_reference(out_root)
+
+    def boom(*a, **kw):
+        raise RuntimeError("killed")
+
+    monkeypatch.setattr(cli, "train", boom)
+    with pytest.raises(RuntimeError):
+        cli.main(_train_args(out_root))
+    root = out_root / "trained" / "run1"
+    tj = json.loads((root / "train.json").read_text(encoding="utf-8"))
+    assert tj["finished"] is False and tj["ended"] is None
+    assert tj["layer_type"] == "full_attention" and tj["seed"] == 0 and "persvectrain_commit" in tj
+    assert set(tj["splits"]) == {"assertive", "reference"}
+    assert not (root / "persona" / MODEL / "bf16" / "assertive.pt").exists()
+
+
+def test_cli_train_json_survives_failed_model_load(out_root, monkeypatch):
+    _fake_reference(out_root)
+
+    def bad_load(key):
+        raise OSError("no weights")
+
+    monkeypatch.setattr(cli, "load_model", bad_load)
+    with pytest.raises(OSError):
+        cli.main(_train_args(out_root))
+    tj = json.loads((out_root / "trained" / "run1" / "train.json").read_text(encoding="utf-8"))
+    assert tj["finished"] is False and tj["layer_type"] is None
 
 
 def test_cli_train_needs_reference(tiny, out_root):

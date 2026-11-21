@@ -88,7 +88,7 @@ def config_dict(cfg: TrainConfig) -> dict:
     return {k: (str(v) if isinstance(v, Path) else v) for k, v in asdict(cfg).items()}
 
 
-def build_train_json(cfg: TrainConfig, sources: dict, layer_type: str, dropped_traits: dict[str, str],
+def build_train_json(cfg: TrainConfig, sources: dict, layer_type: str | None, dropped_traits: dict[str, str],
                      splits: dict) -> dict:
     return {
         "config": config_dict(cfg),

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from dataclasses import MISSING, fields
 from pathlib import Path
 from types import SimpleNamespace
@@ -123,6 +124,10 @@ def _config_from_args(args, traits: list[str]) -> TrainConfig:
     return TrainConfig(**kw)
 
 
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
 def cmd_train(args) -> int:
     cfg = _config_from_args(args, [slugify(t) for t in args.traits])
     src = source_dir(cfg)
@@ -133,6 +138,9 @@ def cmd_train(args) -> int:
         print("no usable traits left", flush=True)
         return 1
     cfg.traits = kept
+    root = run_root(cfg.out, cfg.run_name)
+    if root.exists():  # fail before any expensive work; prepare_run checks again
+        raise FileExistsError(f"run {root} exists; pick another --run-name")
 
     ref_file = reference_path(cfg.out, cfg.model)
     if not ref_file.exists():
@@ -154,11 +162,16 @@ def cmd_train(args) -> int:
     sources["reference"] = str(ref_file)
     splits["reference"] = {"train": [r.id for r in ref_train], "held": [r.id for r in ref_held]}
 
-    model, tok = load_model(cfg.model)
     vec_dir = prepare_run(cfg)
-    root = run_root(cfg.out, cfg.run_name)
-    ltype = layer_type(model, cfg.layer)
-    log(f"train {cfg.run_name}: {cfg.mode}, traits {kept}, layer {cfg.layer} ({ltype})")
+    # written before the model loads and before training (finished false): a killed run keeps its config, seed,
+    # commits and splits; layer_type is filled in once the model is loaded
+    meta = build_train_json(cfg, sources, None, dropped, splits)
+    meta.update(finished=False, started=_now(), ended=None)
+    write_json(root / "train.json", meta)
+    model, tok = load_model(cfg.model)
+    meta["layer_type"] = layer_type(model, cfg.layer)
+    write_json(root / "train.json", meta)
+    log(f"train {cfg.run_name}: {cfg.mode}, traits {kept}, layer {cfg.layer} ({meta['layer_type']})")
 
     with open(root / "steps.jsonl", "a", encoding="utf-8") as steps:
         def log_step(entry: dict) -> None:
@@ -169,7 +182,8 @@ def cmd_train(args) -> int:
 
     for slug in kept:
         write_vectors(vec_dir, slug, cfg.layer, vectors[slug], src, cfg.run_name, seed=cfg.seed)
-    write_json(root / "train.json", build_train_json(cfg, sources, ltype, dropped, splits))
+    meta.update(finished=True, ended=_now())
+    write_json(root / "train.json", meta)
     log(f"train {cfg.run_name}: wrote {root}")
     return 0
 
