@@ -1,4 +1,4 @@
-"""Command line: `python -m persvectrain {check, reference, train, eval} ...`."""
+"""Command line: `python -m persvectrain {check, reference, train, eval, report} ...`."""
 from __future__ import annotations
 
 import argparse
@@ -21,6 +21,7 @@ from persvectrain.evaluate import evaluate
 from persvectrain.generate import generate as _generate
 from persvectrain.output import (REPO, build_train_json, prepare_run, run_dir, run_root, source_dir,
                                  write_vectors)
+from persvectrain.report import format_table, pick_run
 from persvectrain.steering import layer_type
 from persvectrain.train import RefAnswer, TrainConfig, TraitData, train
 
@@ -159,8 +160,10 @@ def cmd_train(args) -> int:
     write_json(root / "train.json", meta)
     log(f"train {cfg.run_name}: {cfg.mode}, traits {kept}, layer {cfg.layer} ({meta['layer_type']})")
 
+    t0 = time.monotonic()
     with open(root / "steps.jsonl", "a", encoding="utf-8") as steps:
         def log_step(entry: dict) -> None:
+            entry = {**entry, "t": round(time.monotonic() - t0, 2)}  # seconds since training start
             steps.write(json.dumps(entry) + "\n")
             steps.flush()
 
@@ -229,6 +232,24 @@ def _add_eval_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--free-gen-tokens", type=int, default=4096, help="max new tokens per free answer")
 
 
+# ---------------------------------------------------------------- report
+
+
+def cmd_report(args) -> int:
+    evals: dict[str, dict] = {}
+    for run in args.runs:
+        path = run_root(Path(args.out), run) / "eval.json"
+        if not path.exists():
+            print(f"{run}: no eval.json")
+            continue
+        evals[run] = read_json(path)
+    if evals:
+        print(format_table(evals))
+    best = pick_run(evals)
+    print(f"picked: {best}" if best else "no run passes")
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 
 _REQUIRED_TYPES = {"model": str, "layer": int, "mode": str, "source": str, "out": str, "run_name": str}
@@ -282,6 +303,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-name", required=True, dest="run_name")
     _add_eval_flags(p)
     p.set_defaults(func=cmd_eval)
+
+    p = sub.add_parser("report", help="pass/fail table over runs and the best run")
+    p.add_argument("--out", required=True, help="out root holding trained/<run>/eval.json")
+    p.add_argument("--runs", nargs="+", required=True)
+    p.set_defaults(func=cmd_report)
     return parser
 
 

@@ -89,6 +89,8 @@ def test_cli_train_end_to_end_tiny(tiny, out_root, capsys):
 
     steps = [json.loads(l) for l in (root / "steps.jsonl").read_text(encoding="utf-8").splitlines()]
     assert len(steps) == 5 and steps[0]["step"] == 0 and steps[0]["trait"] == "assertive"  # 18 train / 4
+    ts = [s["t"] for s in steps]
+    assert ts == sorted(ts) and ts[0] >= 0
 
     tj = json.loads((root / "train.json").read_text(encoding="utf-8"))
     assert tj["config"]["traits"] == ["assertive"] and tj["config"]["epochs"] == 1
