@@ -13,6 +13,7 @@ OUT="${OUT:-/scratch/inf0/user/nzukowsk/PersVecFast/out}"
 TRAITS="${TRAITS:-Assertive Sycophantic Opportunistic Empathy Evil Sarcastic Agreeableness}"
 TRAIN_EXTRA="${TRAIN_EXTRA:-}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+export PVT_LIB="$HERE/lib.sh"  # run.sbatch / train.sbatch find lib.sh through it (sbatch exports the env), any cwd
 mkdir -p slurm-logs  # sbatch opens --output=slurm-logs/... (relative to the submit directory) before the job runs
 
 REF=$(sbatch --parsable "$@" "$HERE/train.sbatch" reference --model "$MODEL" --out "$OUT")

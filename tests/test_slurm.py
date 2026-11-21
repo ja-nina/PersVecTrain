@@ -47,3 +47,19 @@ def test_arg_value_equals_form():
     assert r.returncode == 0 and r.stdout == "/o dir/x"
     r = _bash('source slurm/lib.sh; pvt_arg_value --run-name "$@"', "train", "--out=o", "--run-name=r1")
     assert r.stdout == "r1"
+
+
+def test_sweep_exports_lib_path_from_any_cwd(tmp_path):
+    """sweep.sh run from another dir: every sbatch sees PVT_LIB = this checkout's slurm/lib.sh."""
+    log = tmp_path / "sbatch.log"
+    elsewhere = tmp_path / "cwd"
+    elsewhere.mkdir()
+    # a fake sbatch (exported function: works on Windows paths too, unlike a PATH entry)
+    code = (f'sbatch() {{ echo "$PVT_LIB" >> "{log.as_posix()}"; echo 42; }}; export -f sbatch; '
+            f'bash "{(SLURM / "sweep.sh").as_posix()}" m 12')
+    r = subprocess.run([BASH, "-c", code], capture_output=True, text=True, cwd=elsewhere)
+    assert r.returncode == 0, r.stderr
+    libs = log.read_text(encoding="utf-8").split()
+    assert len(libs) == 5 and len(set(libs)) == 1
+    r = subprocess.run([BASH, "-c", f'[ -f "{libs[0]}" ] && cmp -s "{libs[0]}" "{(SLURM / "lib.sh").as_posix()}"'])
+    assert r.returncode == 0, libs[0]
