@@ -10,6 +10,7 @@ SOURCE="${SOURCE:-/scratch/inf0/user/nzukowsk/PersVecFast/out}"
 OUT="${OUT:-/scratch/inf0/user/nzukowsk/PersVecFast/out}"
 TRAITS="${TRAITS:-Assertive Sycophantic Opportunistic Empathy Evil Sarcastic Agreeableness}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p slurm-logs  # sbatch opens --output=slurm-logs/... (relative to the submit directory) before the job runs
 
 REF=$(sbatch --parsable "$@" "$HERE/train.sbatch" reference --model "$MODEL" --out "$OUT")
 echo "reference job: $REF"
