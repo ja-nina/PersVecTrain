@@ -40,16 +40,15 @@ def instruction(n_options: int) -> str:
 
 
 def parse_answer(text: str, n_options: int) -> str | None:
-    """The letter after the LAST `ANSWER` (any case; optional `:` / `*` / spaces / `(` between): one of the
-    question's option letters (any case, not followed by another letter), upper-cased. None when there is no
-    marker or the last marker's letter is not valid (none = wrong)."""
-    marks = list(re.finditer(r"ANSWER", text, flags=re.IGNORECASE))
-    if not marks:
-        return None
-    m = re.match(rf"[\s:*(]*([A-Za-z])(?![A-Za-z])", text[marks[-1].end():])
-    if m is None or m.group(1).upper() not in LETTERS[:n_options]:
-        return None
-    return m.group(1).upper()
+    """The answer letter as MA_Environments' games parse it (QADebateParser with testbed.parsers.base.keyword_value,
+    reimplemented here, not imported): the LAST match, case-insensitive, of `ANSWER`, optional `*` / `_`, a required
+    `:` or `=`, optional opening `*`, `_`, `[`, `(`, `<`, quotes or backticks, then one of the question's option letters not followed by
+    another letter. Upper-cased; None when nothing matches (none = wrong). A later marker without a valid letter
+    is no match, so an earlier valid one wins, as in the games."""
+    letters = LETTERS[:n_options]
+    pattern = rf"ANSWER\s*[*_]*\s*[:=]\s*[*_\[(<\"'`]*\s*([{letters}{letters.lower()}](?![A-Za-z]))"
+    matches = list(re.finditer(pattern, text or "", re.IGNORECASE))
+    return matches[-1].group(1).upper() if matches else None
 
 
 def load_tokenizer(model_key: str):

@@ -27,17 +27,30 @@ KINDS = ("trained", "source_full", "trained_random")
 # ---------------------------------------------------------------- parse_answer
 
 
+# Expected values are what MA_Environments' QADebateParser gives (testbed.parsers.base.keyword_value with the
+# question's letters, both cases, not followed by a letter): the LAST full match of the pattern wins, so a later
+# marker without a valid letter does not hide an earlier valid one.
 @pytest.mark.parametrize("text,n,letter", [
     ("Reasoning... ANSWER: C", 4, "C"),
-    ("so the final answer: c", 4, "C"),
+    ("ANSWER: C\n\nI hope this answer helps.", 4, "C"),  # "answer helps": no ':' / '=', not a marker
+    ("ANSWER: C\nThat answers it.", 4, "C"),
+    ("ANSWER: [C]", 4, "C"),
     ("ANSWER: (D)", 4, "D"),
     ("**ANSWER:** B", 4, "B"),
-    ("ANSWER: A at first. Re-checking. ANSWER: B", 4, "B"),
-    ("ANSWER: A. Hmm, the answer is unclear.", 4, None),  # the LAST marker decides, and it has no valid letter
-    ("ANSWER: A ... ANSWER: E", 4, None),  # last marker's letter is beyond the options: none, not the earlier A
-    ("ANSWER: A ... ANSWER: Because", 4, None),
+    ("**ANSWER**: c", 4, "C"),
+    ("ANSWER = b", 4, "B"),
+    ("answer: c", 4, "C"),
+    ("so the final answer: c", 4, "C"),
+    # MA gives None: after "answer:" comes "I", not one of A-D, and the pattern takes only the first token
+    ("Final answer: I think C", 4, None),
+    ("Final answer: I think C", 10, "I"),  # ... and "I" with 10 options (MA does the same)
+    ("ANSWER: A at first. Re-checking. ANSWER: B", 4, "B"),  # last of two valid markers
+    ("ANSWER: A ... ANSWER: E", 4, "A"),  # E is beyond the options: no match there, the earlier A wins (as MA)
+    ("ANSWER: A. Hmm, the answer is unclear.", 4, "A"),
+    ("ANSWER: A ... ANSWER: Because", 4, "A"),
     ("ANSWER: E", 4, None),
     ("ANSWER: J", 10, "J"),
+    ("ANSWER C", 4, None),  # ':' or '=' is required
     ("The option is C", 4, None),
     ("ANSWER: Because", 4, None),  # a letter followed by another letter is a word
     ("", 4, None),
