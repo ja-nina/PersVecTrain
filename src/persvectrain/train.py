@@ -8,6 +8,7 @@ from typing import Callable
 
 import torch
 from torch import Tensor, nn
+from persvecfast.models import request_seed
 from transformers import get_cosine_schedule_with_warmup
 
 from persvectrain.data import Pair
@@ -96,11 +97,9 @@ def _optimizer(cfg: TrainConfig, params: list[nn.Parameter], total: int):
     return opt, sched
 
 
-def _seed(cfg: TrainConfig, *parts: int) -> int:
-    s = cfg.seed
-    for p in parts:
-        s = s * 1_000_003 + p
-    return s % (2 ** 63)
+def _generator(cfg: TrainConfig, slug: str, purpose: str) -> torch.Generator:
+    """Seeded from cfg.seed and the trait slug (not its position), so reordering traits keeps each vector."""
+    return torch.Generator().manual_seed(request_seed(cfg.seed, slug, purpose))
 
 
 def _epoch_batches(n: int, batch: int, gen: torch.Generator) -> list[list[int]]:
@@ -144,7 +143,7 @@ def _train_solo(model, tok, cfg, traits, kl_train, log_step) -> dict[str, Tensor
 
     out: dict[str, Tensor] = {}
     step = 0
-    for pos, slug in enumerate(cfg.traits):
+    for slug in cfg.traits:
         td = traits[slug]
         if not td.train:
             raise ValueError(f"trait {slug} has no train pairs")
@@ -155,8 +154,8 @@ def _train_solo(model, tok, cfg, traits, kl_train, log_step) -> dict[str, Tensor
         per_epoch = math.ceil(len(td.train) / cfg.batch)
         total = cfg.epochs * per_epoch
         opt, sched = _optimizer(cfg, [v], total)
-        order_gen = torch.Generator().manual_seed(_seed(cfg, pos, 0))
-        sign_gen = torch.Generator().manual_seed(_seed(cfg, pos, 1))
+        order_gen = _generator(cfg, slug, "shuffle")
+        sign_gen = _generator(cfg, slug, "sign")
         kl_cursor = 0
 
         for _epoch in range(cfg.epochs):
@@ -164,18 +163,20 @@ def _train_solo(model, tok, cfg, traits, kl_train, log_step) -> dict[str, Tensor
                 sign = 1 if int(torch.randint(0, 2, (1,), generator=sign_gen)) == 1 else -1
                 norm = float(v.detach().norm())
                 lr = float(sched.get_last_lr()[0])
-                # Per-sequence scale 1 / (pairs this step + kl_batch), as the brief specifies.
-                scale = 1.0 / (len(idx) + cfg.kl_batch)
+                # L = mean persona loss over this step's pairs + lambda_kl * mean KL over its KL answers;
+                # each sequence backpropagates its share of L separately.
+                p_scale = 1.0 / len(idx)
+                kl_scale = cfg.lambda_kl / cfg.kl_batch
                 opt.zero_grad(set_to_none=True)
 
                 lp_sum = 0.0
                 for i in idx:
-                    lp_sum += _persona_backward(model, cfg.layer, v, sign, enc[i], lp0[i], cfg.beta, scale)
+                    lp_sum += _persona_backward(model, cfg.layer, v, sign, enc[i], lp0[i], cfg.beta, p_scale)
                 kl_sum = 0.0
                 if use_kl:
                     for _ in range(cfg.kl_batch):
                         kl_sum += _kl_backward(model, cfg.layer, v, sign, kl_enc[kl_cursor % len(kl_enc)],
-                                               cfg.lambda_kl * scale)
+                                               kl_scale)
                         kl_cursor += 1
 
                 opt.step()

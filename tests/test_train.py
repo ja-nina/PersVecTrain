@@ -134,14 +134,70 @@ def test_dom_init_starts_at_start_vector(tiny_model, char_tok):
 
 def test_same_seed_same_vectors(tiny_model, char_tok):
     td = _trait("t1")
-    cfg = _cfg(lambda_kl=1.0)
+    cfg = _cfg(lambda_kl=1.0, epochs=1)
     a = train(tiny_model, char_tok, cfg, {"t1": td}, _refs(), lambda d: None)["t1"]
     b = train(tiny_model, char_tok, cfg, {"t1": td}, _refs(), lambda d: None)["t1"]
     assert torch.equal(a, b)
-    c = train(tiny_model, char_tok, _cfg(lambda_kl=1.0, seed=1), {"t1": td}, _refs(), lambda d: None)["t1"]
+    c = train(tiny_model, char_tok, _cfg(lambda_kl=1.0, epochs=1, seed=1), {"t1": td}, _refs(), lambda d: None)["t1"]
     assert not torch.equal(a, c)
 
 
 def test_joint_not_implemented(tiny_model, char_tok):
     with pytest.raises(NotImplementedError):
         train(tiny_model, char_tok, _cfg(mode="joint"), {"t1": _trait("t1")}, _refs(), lambda d: None)
+
+
+@pytest.mark.parametrize("lambda_kl", [0.0, 3.0])
+def test_step_gradient_is_mean_loss_gradient(tiny_model, char_tok, monkeypatch, lambda_kl):
+    """The step's gradient on v = grad of mean persona loss over its pairs + lambda_kl * mean KL over its answers."""
+    from persvectrain import train as train_mod
+    from persvectrain.losses import persona_loss
+
+    grads = []
+    real_step = torch.optim.AdamW.step
+
+    def recording_step(self, *a, **kw):
+        grads.append(self.param_groups[0]["params"][0].grad.detach().clone())
+        return real_step(self, *a, **kw)
+
+    monkeypatch.setattr(train_mod.torch.optim.AdamW, "step", recording_step)
+    td = _trait("t1", n_train=2)
+    refs = _refs(3)
+    logs: list[dict] = []
+    train(tiny_model, char_tok, _cfg(lambda_kl=lambda_kl, batch=2, kl_batch=2, epochs=1), {"t1": td}, refs,
+          logs.append)
+    assert len(grads) == 1
+    sign = logs[0]["sign"]
+
+    v = td.start.clone().requires_grad_(True)
+    p_losses = []
+    for p in td.train:
+        ids_p, s_p = encode(char_tok, p.question, p.pos, MAX_TOK)
+        ids_n, s_n = encode(char_tok, p.question, p.neg, MAX_TOK)
+        with torch.no_grad():
+            lp0_p, lp0_n = answer_logprob(tiny_model, ids_p, s_p), answer_logprob(tiny_model, ids_n, s_n)
+        with steer(tiny_model, LAYER, sign * v):
+            lpc_p, lpc_n = answer_logprob(tiny_model, ids_p, s_p), answer_logprob(tiny_model, ids_n, s_n)
+        p_losses.append(persona_loss(lpc_p, lp0_p, lpc_n, lp0_n, sign, 0.1))
+    total = torch.stack(p_losses).mean()
+    kls = []
+    for r in refs[:2]:
+        ids, s = encode(char_tok, r.question, r.answer_text, MAX_TOK)
+        with torch.no_grad():
+            lp0 = answer_logprobs(tiny_model, ids, s)
+        with steer(tiny_model, LAYER, sign * v):
+            kls.append(kl_loss(lp0, answer_logprobs(tiny_model, ids, s)))
+    if lambda_kl:
+        total = total + lambda_kl * torch.stack(kls).mean()
+    (expected,) = torch.autograd.grad(total, v)
+    assert torch.allclose(grads[0], expected, rtol=1e-4, atol=1e-7)
+    assert logs[0]["loss_p"] == pytest.approx(float(torch.stack(p_losses).mean().detach()), rel=1e-5)
+    if lambda_kl:
+        assert logs[0]["loss_kl"] == pytest.approx(float(torch.stack(kls).mean().detach()), rel=1e-5)
+
+
+def test_trait_order_does_not_change_vectors(tiny_model, char_tok):
+    traits = {"A": _trait("A", seed=1), "B": _trait("B", n_train=4, seed=2)}
+    ab = train(tiny_model, char_tok, _cfg(traits=["A", "B"], lambda_kl=1.0, epochs=1), traits, _refs(), lambda d: None)
+    ba = train(tiny_model, char_tok, _cfg(traits=["B", "A"], lambda_kl=1.0, epochs=1), traits, _refs(), lambda d: None)
+    assert torch.equal(ab["A"], ba["A"]) and torch.equal(ab["B"], ba["B"])
