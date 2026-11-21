@@ -20,7 +20,8 @@ PersVecFast (extracted responses and activations) and imports its `persvecfast` 
   `eval.json`
 - `eval` - re-run the evaluation of an existing run
 - `freegen --out O --run-name R` - free generation of a finished run on vLLM (unsteered, and per trait trained /
-  source_full / trained_random at c = +-1): fills eval.json's `free_gen` block and recomputes the pass rule
+  source_full / trained_random at c = +-1): fills eval.json's `free_gen` block and recomputes the pass rule;
+  resumes from its saved answers, `--fresh`, `--rescore-only` (below)
 - `report --out O --runs R1 R2 ...` - one pass/fail table over runs and traits, and the run that passes the most
   traits (tie: larger mean trained margin at c = +-1), or "no run passes"
 
@@ -34,10 +35,25 @@ step, `lr`, `t` = seconds since training start), plus one `kind: "start"` line a
 or of the run (joint): per trait, the mean train persona margin of the start vector at c = +1 (`margin_pos`) and
 c = -1 (`margin_neg`) and `beta_margin_pos` / `beta_margin_neg` = beta * margin.
 
-`eval.json` is written once the teacher-forced part is done (`free_gen.status: "pending"`, the pass rule with its
-length checks listed in `skipped`) and rewritten when free generation is done (`status: "done"`); a job killed
-during free generation keeps the first one. `timing.teacher_forced_s` / `timing.free_gen_s` are the seconds of
-each part.
+`eval.json` is written by `train` once the teacher-forced part is done (`free_gen.status: "pending"`, the pass
+rule with its free-generation checks - length, accuracy and random-length per c - listed in `skipped`) and
+rewritten by `freegen` when free generation is done (`status: "done"`, the pass rule recomputed with those
+checks); a job killed during free generation leaves it `pending`. `timing.teacher_forced_s` / `timing.free_gen_s`
+are the seconds of each part (`free_gen_s` of the last `freegen` job only, when it resumed).
+
+`freegen` appends every engine chunk's answers to `trained/<run>/freegen_answers.jsonl.gz` as soon as the chunk
+is done (gzip, one line per answer: `key` = [trait or "-", kind, c, question id], `text`, `n_tokens`,
+`finish_reason`, `max_tokens`, `seed`), and scores from that file. Rerunning the same `freegen` (e.g. the same
+`sbatch slurm/train.sbatch freegen ...` after a killed or timed-out job) resumes: answers already saved for the
+same request (key, seed and `--max-tokens`) are reused, only the rest is generated; a damaged last line (job
+killed while writing) is dropped and that answer regenerated. `--fresh` deletes the file first and regenerates
+everything. `--rescore-only` loads no model and no engine: it re-parses the saved answers (e.g. after a change to
+`parse_answer`) and rewrites eval.json's free-gen parts and pass rule; it needs a saved answer for every request
+and uses the `max_tokens` eval.json records unless `--max-tokens` is given.
+
+The answer letter is parsed as MA_Environments' games parse it (`QADebateParser`): the last `ANSWER: X` (any
+case, optional markdown around `ANSWER`, `:` or `=` required, optional `*`, `_`, `[`, `(`, `<`, quote or backtick
+before the letter), X one of the question's option letters and not followed by another letter; no match = wrong.
 
 ## Cluster run
 
@@ -103,9 +119,19 @@ Joint run at the picked lambda_kl (the value in the picked run's name, e.g. `sol
         --source /scratch/inf0/user/nzukowsk/PersVecFast/out \
         --out /scratch/inf0/user/nzukowsk/PersVecFast/out
 
-`freegen` alone (an existing run whose status is `pending`, e.g. after a failed free generation) runs through the generic runner, which sets the same vLLM environment:
+`freegen` alone (an existing run whose status is `pending`, e.g. after a failed or timed-out free generation)
+runs through the generic runner, which sets the same vLLM environment; it resumes from the run's
+`freegen_answers.jsonl.gz` (add `--fresh` to regenerate everything):
 
     sbatch slurm/train.sbatch freegen --out /scratch/inf0/user/nzukowsk/PersVecFast/out --run-name solo_kl1
+
+Re-parse the saved answers without generating (no model, no vLLM, no GPU: run it directly in the env):
+
+    python -m persvectrain freegen --out /scratch/inf0/user/nzukowsk/PersVecFast/out --run-name solo_kl1 \
+        --rescore-only
+
+`report` shows a pending run's traits as PENDING, or `PENDING (FAIL: <checks>)` when a teacher-forced check
+already fails (free generation cannot make it pass); a pending run is never picked.
 
 `--no-free-gen` on `run.sbatch` (or `train`) skips free generation: the run's free_gen status is `disabled`, its
 length and accuracy checks are skipped (listed in `skipped`) and `report` shows it normally. Re-running `eval`
