@@ -315,6 +315,9 @@ def evaluate(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], trained
     # a previous "disabled" run has no free-gen block to keep: the re-run stays "pending" so `freegen` can run
     if free_gen and previous and previous.get("free_gen") and previous["free_gen"].get("status") != "disabled":
         res["free_gen"] = previous["free_gen"]
+        if "random_dirs" not in res["free_gen"]:
+            # free answers of an old single-twin run: kept, but `freegen` must rerun to regenerate trained_random
+            res["free_gen"] = {**res["free_gen"], "status": "pending"}
         res["timing"]["free_gen_s"] = previous.get("timing", {}).get("free_gen_s")
         for s in slugs:
             fg = previous.get("traits", {}).get(s, {}).get("free_gen")

@@ -324,7 +324,8 @@ def test_evaluate_keeps_previous_free_gen_block(tiny_model, char_tok, tmp_path):
     blk = {"n": 2, "mean_tokens": 8.0, "cut_share": 0.0, "accuracy": 1.0, "accuracy_se": 0.0,
            "qid": ["r0", "r1"], "tokens": [8, 8], "cut": [False, False], "answer": ["C", "C"], "correct": [1, 1]}
     previous = json.loads(json.dumps(first))
-    previous["free_gen"] = {"enabled": True, "status": "done", "max_tokens": 15360, "unsteered": blk}
+    previous["free_gen"] = {"enabled": True, "status": "done", "max_tokens": 15360, "random_dirs": 5,
+                            "unsteered": blk}
     previous["timing"]["free_gen_s"] = 12.5
     previous["traits"]["t1"]["free_gen"] = {"unsteered": blk, **{k: {"c=+1": blk, "c=-1": blk}
                                                                  for k in ("trained", "source_full", "trained_random")}}
@@ -428,3 +429,18 @@ def test_random_kinds_are_the_mean_of_five_directions(tiny_model, char_tok, tmp_
     # the other kinds carry no per-direction block, and k = 0 stays the reported twin
     assert "per_direction" not in kinds["trained"]["c=+1"]
     assert res["traits"]["t1"]["norms"]["trained_random"] == pytest.approx(float(v.norm()))
+
+
+def test_evaluate_old_single_twin_free_gen_goes_back_to_pending(tiny_model, char_tok, tmp_path):
+    cfg = _cfg(tmp_path)
+    td = _trait("t1", 1)
+    first = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2))
+    blk = {"n": 2, "mean_tokens": 8.0, "cut_share": 0.0, "accuracy": 1.0, "accuracy_se": 0.0,
+           "qid": ["r0", "r1"], "tokens": [8, 8], "cut": [False, False], "answer": ["C", "C"], "correct": [1, 1]}
+    previous = json.loads(json.dumps(first))
+    previous["free_gen"] = {"enabled": True, "status": "done", "max_tokens": 15360, "unsteered": blk}  # no random_dirs
+    previous["traits"]["t1"]["free_gen"] = {"unsteered": blk, **{k: {"c=+1": blk, "c=-1": blk}
+                                                                 for k in ("trained", "source_full", "trained_random")}}
+    res = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2), previous=previous)
+    assert res["free_gen"]["status"] == "pending" and res["free_gen"]["max_tokens"] == 15360
+    assert res["traits"]["t1"]["free_gen"] == previous["traits"]["t1"]["free_gen"]
