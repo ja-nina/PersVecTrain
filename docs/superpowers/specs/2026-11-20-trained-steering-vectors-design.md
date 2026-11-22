@@ -156,7 +156,9 @@ what helps?" ablation, then e.g. 0.1, 1, 10); its value is not fixed in this des
    - *(Updated 2026-11-22: persona judge.)* Judged persona answers (`persona_judge`, "Persona judge" below), paired
      by question, ties within 1 SE: at c = +1 the trained vector's judge expression score is **at least** the
      source's (judge@+1); at c = -1 (under the eliciting prompt) it **suppresses at least as much** (judge@-1,
-     score_source - score_trained >= -SE); and its judge coherence is at least the source's (coherence@c). A question
+     score_source - score_trained >= -SE); and its judge coherence is at least the unsteered model's (coherence@c, against the unsteered answers
+     under the neutral prompt on the same questions; changed 2026-11-22 from "at least the source's"; `report`
+     recomputes the pass flags from the stored scores, so older eval.json files are judged by this rule). A question
      with a None judge score in either kind is left out of the pair. Without judge results (status pending or
      disabled) these checks are skipped and listed in the trait's `pass.skipped`.
    *(Calls made by me.)* Held-out is small, so "at least as much" / "no worse" count a difference within 1 SE as a

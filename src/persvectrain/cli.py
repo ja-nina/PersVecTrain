@@ -16,7 +16,7 @@ from persvecfast.util import log, read_json, slugify, write_json
 
 from persvectrain import data as data_mod
 from persvectrain.data import full_source_vector, load_pairs, start_vector, supergpqa_prompts, usable_traits
-from persvectrain.evaluate import evaluate
+from persvectrain.evaluate import evaluate, pass_rule
 from persvectrain.freegen import MAX_TOKENS as FREEGEN_MAX_TOKENS
 from persvectrain.freegen import POOL, run_freegen
 from persvectrain.persona import MAX_TOKENS as PERSONA_MAX_TOKENS
@@ -321,6 +321,13 @@ def cmd_report(args) -> int:
             print(f"{run}: no eval.json")
             continue
         evals[run] = read_json(path)
+        # the pass flags are recomputed with the current rule from the stored per-item results (an eval.json written
+        # under an older rule, e.g. coherence against the source, is judged by today's rule; old formats keep theirs)
+        for t in evals[run]["traits"].values():
+            try:
+                t["pass"] = pass_rule(t)
+            except (KeyError, TypeError, ValueError):
+                pass
     if evals:
         print(format_table(evals))
     best = pick_run(evals)

@@ -348,12 +348,15 @@ def _pj_block(score, coherence=None) -> dict:
     return {"qid": [f"q{i}" for i in range(n)], "score": list(score), "coherence": list(coherence or [50] * n)}
 
 
-def _judge_eval(trained, source, c_trained=None, c_source=None) -> dict:
+def _judge_eval(trained, source, c_trained=None, c_source=None, c_unsteered=None) -> dict:
     """Persona-judge blocks with the same trained / source scores at c = +1 and -1."""
     te = _trait_eval([2] * 4, [1] * 4, [0.1] * 4, [1.0] * 4, [0.5] * 4, GOOD_TOKENS)
     te["persona_judge"] = {k: {c: _pj_block(v, cv) for c in ("c=+1", "c=-1")}
                            for k, v, cv in (("trained", trained, c_trained), ("source_full", source, c_source),
                                             ("trained_random", [0] * len(trained), None))}
+    n = len(trained)
+    te["persona_judge"]["unsteered"] = _pj_block([0] * n, c_unsteered)
+    te["persona_judge"]["elicited"] = _pj_block([90] * n, [10] * n)
     return te
 
 
@@ -376,6 +379,17 @@ def test_pass_rule_judge_ties_within_one_se_and_beyond():
 def test_pass_rule_coherence_check_and_none_scores():
     r = ev.pass_rule(_judge_eval([50] * 4, [50] * 4, c_trained=[20, 21, 19, 20], c_source=[60] * 4))
     assert r["failed"] == ["coherence@c=+1", "coherence@c=-1"]
+    # coherence is measured against the unsteered model, not the source: trained as coherent as the source but
+    # below unsteered fails; source's difference to unsteered is recorded next to it
+    r = ev.pass_rule(_judge_eval([50] * 4, [50] * 4, c_trained=[60, 61, 59, 60], c_source=[60] * 4,
+                                 c_unsteered=[90] * 4))
+    co = r["checks"]["c=+1"]["coherence"]
+    assert r["failed"] == ["coherence@c=+1", "coherence@c=-1"] and co["against"] == "unsteered"
+    assert co["diff_mean"] == pytest.approx(-30) and co["source_diff_mean"] == pytest.approx(-30)
+    # a tie with unsteered (within 1 SE) passes even when the source is less coherent
+    r = ev.pass_rule(_judge_eval([50] * 4, [50] * 4, c_trained=[88, 92, 89, 91], c_source=[20] * 4,
+                                 c_unsteered=[90] * 4))
+    assert r["passed"] is True
     # a None score drops that question from the pair (3 pairs left, all -10 -> beyond 1 SE of 0)
     te = _judge_eval([40, 40, 40, 40], [50, 50, 50, 50])
     te["persona_judge"]["trained"]["c=+1"]["score"][0] = None

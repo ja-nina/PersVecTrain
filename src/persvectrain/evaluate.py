@@ -86,8 +86,9 @@ def _correct_diff(fg: dict, a: str, b: str, c: str) -> tuple[float | None, float
 
 def _judge_diff(pj: dict, a: str, b: str, c: str, field: str) -> tuple[float | None, float | None, int]:
     """Paired mean and SE over questions of field_a - field_b of the persona judge (field "score" or "coherence");
-    a question with a None judge score in either kind is left out of that pair."""
-    ba, bb = pj[a][c], pj[b][c]
+    a question with a None judge score in either kind is left out of that pair. The unsteered / elicited blocks
+    have no c level (one block per trait)."""
+    ba, bb = (pj[k] if k in ("unsteered", "elicited") else pj[k][c] for k in (a, b))
     if ba["qid"] != bb["qid"]:
         raise ValueError(f"persona-judge answers of {a} and {b} at {c} are not paired: question ids differ")
     diffs = [float(x) - float(y) for x, y in zip(ba[field], bb[field]) if x is not None and y is not None]
@@ -106,7 +107,9 @@ def pass_rule(trait_eval: dict) -> dict:
     skipped (named in "skipped"). Persona judge (`persona`, trait_eval["persona_judge"]; skipped when absent), paired
     over questions with None scores left out, ties within 1 SE: judge@+1 mean(score_trained - score_source_full)
     >= -SE (expresses the trait at least as much), judge@-1 mean(score_source_full - score_trained) >= -SE (trained
-    suppresses at least as much), coherence@c mean(coherence_trained - coherence_source_full) >= -SE.
+    suppresses at least as much), coherence@c mean(coherence_trained - coherence_unsteered) >= -SE (no measurable
+    coherence loss against the unsteered model, neutral prompt, same questions; the source's difference to unsteered
+    is recorded next to it as source_diff_mean / source_diff_se).
     """
     fg = trait_eval.get("free_gen")
     pj = trait_eval.get("persona_judge")
@@ -135,9 +138,10 @@ def pass_rule(trait_eval: dict) -> dict:
             m, se, n = _judge_diff(pj, *(("trained", "source_full") if c == "c=+1" else ("source_full", "trained")),
                                    c, "score")
             ch["judge"] = {"passed": m is not None and m >= -(se or 0.0), "diff_mean": m, "diff_se": se, "n_pairs": n}
-            m, se, n = _judge_diff(pj, "trained", "source_full", c, "coherence")
+            m, se, n = _judge_diff(pj, "trained", "unsteered", c, "coherence")
+            sm, sse, _ = _judge_diff(pj, "source_full", "unsteered", c, "coherence")
             ch["coherence"] = {"passed": m is not None and m >= -(se or 0.0), "diff_mean": m, "diff_se": se,
-                               "n_pairs": n}
+                               "n_pairs": n, "against": "unsteered", "source_diff_mean": sm, "source_diff_se": sse}
         else:
             skipped += [f"judge@{c}", f"coherence@{c}"]
         rnd["passed"] = rnd["kl_passed"] and rnd.get("length_passed", True)
