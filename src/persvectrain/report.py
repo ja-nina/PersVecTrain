@@ -11,6 +11,13 @@ def is_pending(ev: dict) -> bool:
         (ev.get("persona_judge") or {}).get("status") == "pending"
 
 
+def is_stale(ev: dict) -> bool:
+    """Written before the current code (no persona_judge key, or free generation without random_dirs while not
+    disabled): re-evaluate it (`slurm/reeval.sbatch`); it is never picked."""
+    fg = ev.get("free_gen") or {}
+    return "persona_judge" not in ev or (fg.get("status") != "disabled" and "random_dirs" not in fg)
+
+
 def n_passed(ev: dict) -> int:
     return sum(1 for t in ev["traits"].values() if t["pass"]["passed"])
 
@@ -43,7 +50,7 @@ def pick_per_trait(evals: dict[str, dict]) -> dict[str, str | None]:
     for t in traits:
         best, best_m = None, None
         for name, ev in evals.items():
-            if is_pending(ev) or t not in ev["traits"] or not ev["traits"][t]["pass"]["passed"]:
+            if is_pending(ev) or is_stale(ev) or t not in ev["traits"] or not ev["traits"][t]["pass"]["passed"]:
                 continue
             m = trait_margin(ev["traits"][t])
             if best_m is None or m > best_m:
@@ -57,7 +64,7 @@ def pick_run(evals: dict[str, dict]) -> str | None:
     Runs with pending free generation are never picked."""
     best, best_key = None, None
     for name, ev in evals.items():
-        if is_pending(ev):
+        if is_pending(ev) or is_stale(ev):
             continue
         n = n_passed(ev)
         if n == 0:
@@ -68,21 +75,47 @@ def pick_run(evals: dict[str, dict]) -> str | None:
     return best
 
 
+def _tf_failed(trait_eval: dict) -> list[str]:
+    """The failed checks that are final while free generation / the judge are pending: teacher-forced ones
+    (persona, kl, and random only when its KL part failed)."""
+    p = trait_eval["pass"]
+    out = []
+    for f in p.get("failed", []):
+        name, _, c = f.partition("@")
+        if name in ("persona", "kl"):
+            out.append(f)
+        elif name == "random":
+            rnd = (p.get("checks", {}).get(c) or {}).get("random") or {}
+            if rnd.get("kl_passed") is False:
+                out.append(f)
+    return out
+
+
 def _cell(trait_eval: dict, pending: bool = False) -> str:
     p = trait_eval["pass"]
     if pending:  # a teacher-forced check failing already is final: free generation cannot make it pass
-        return "PENDING (FAIL: " + ", ".join(p["failed"]) + ")" if p.get("failed") else "PENDING"
+        tf = _tf_failed(trait_eval)
+        return "PENDING (FAIL: " + ", ".join(tf) + ")" if tf else "PENDING"
     return "PASS" if p["passed"] else "FAIL (" + ", ".join(p["failed"]) + ")"
 
 
 def format_table(evals: dict[str, dict]) -> str:
-    """Rows: runs; columns: traits (union, in first-seen order); cells PASS or FAIL (failed checks), PENDING
+    """Rows: runs; columns: traits (union, in first-seen order); cells PASS or FAIL (failed checks), OLD for a stale run (one line each under the table), PENDING
     while free generation is pending (PENDING (FAIL: ...) when a teacher-forced check already fails)."""
     traits: list[str] = []
     for ev in evals.values():
         traits += [t for t in ev["traits"] if t not in traits]
-    cells = [[name] + [_cell(ev["traits"][t], is_pending(ev)) if t in ev["traits"] else "-" for t in traits]
-             for name, ev in evals.items()]
+    def cell(ev: dict, t: str) -> str:
+        if t not in ev["traits"]:
+            return "-"
+        return "OLD" if is_stale(ev) else _cell(ev["traits"][t], is_pending(ev))
+
+    cells = [[name] + [cell(ev, t) for t in traits] for name, ev in evals.items()]
     rows = [["run"] + traits] + cells
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
-    return "\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows)
+    text = "\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows)
+    for name, ev in evals.items():
+        if is_stale(ev):
+            text += (f"\nOLD: {name} (written before the current code); re-evaluate: "
+                     f"sbatch slurm/reeval.sbatch --out O --run-name {name}")
+    return text

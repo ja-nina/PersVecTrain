@@ -7,15 +7,16 @@ from persvectrain import cli
 from persvectrain.report import format_table, mean_trained_margin, pick_run
 
 
-def _trait(passed: bool, margin: float = 1.0, failed=None) -> dict:
+def _trait(passed: bool, margin: float = 1.0, failed=None, checks=None) -> dict:
     kinds = {"trained": {"c=+1": {"margin_mean": margin}, "c=-1": {"margin_mean": margin}}}
     return {"kinds": kinds,
-            "pass": {"checks": {}, "failed": failed if failed is not None else ([] if passed else ["kl@c=+1"]),
+            "pass": {"checks": checks or {}, "failed": failed if failed is not None else ([] if passed else ["kl@c=+1"]),
                      "passed": passed}}
 
 
 def _eval(**traits: dict) -> dict:
-    return {"traits": traits, "summary": {k: v["pass"]["passed"] for k, v in traits.items()}}
+    return {"persona_judge": {"status": "done"}, "free_gen": {"status": "done", "random_dirs": 5},
+            "traits": traits, "summary": {k: v["pass"]["passed"] for k, v in traits.items()}}
 
 
 def test_report_picks_most_passing():
@@ -66,7 +67,7 @@ def test_report_cli_no_run_passes(tmp_path, capsys):
 
 
 def _pending(ev: dict) -> dict:
-    ev["free_gen"] = {"enabled": True, "status": "pending"}
+    ev["free_gen"] = {"enabled": True, "status": "pending", "random_dirs": 5}
     return ev
 
 
@@ -110,7 +111,7 @@ def test_report_pending_run_shows_teacher_forced_failures():
 def test_pick_per_trait():
     from persvectrain.report import pick_per_trait
     pend = _eval(x=_trait(True, 9.0))
-    pend["free_gen"] = {"status": "pending"}
+    pend["free_gen"] = {"status": "pending", "random_dirs": 5}
     evals = {"p": pend,
              "a": _eval(x=_trait(True, 1.0), y=_trait(False), z=_trait(False)),
              "b": _eval(x=_trait(True, 2.0), y=_trait(True, 0.5), z=_trait(False)),
@@ -132,3 +133,32 @@ def test_report_per_trait_writes_profile(tmp_path, capsys):
     data = json.loads(prof.read_text(encoding="utf-8"))
     assert data["y"] is None and data["x"]["run"] == "r1"
     assert Path(data["x"]["vector"]) == run_dir(tmp_path, "r1", "m") / "vllm_hook" / "x_L12.pt"
+
+
+def test_stale_detection():
+    from persvectrain.report import is_stale
+    assert not is_stale(_eval(x=_trait(True)))
+    old = _eval(x=_trait(True)); del old["persona_judge"]
+    assert is_stale(old)
+    nord = _eval(x=_trait(True)); del nord["free_gen"]["random_dirs"]
+    assert is_stale(nord)
+    nord["free_gen"]["status"] = "disabled"
+    assert not is_stale(nord)
+
+
+def test_stale_never_picked_and_marked():
+    from persvectrain.report import pick_per_trait
+    old = _eval(x=_trait(True, 9.0)); del old["persona_judge"]
+    evals = {"old": old, "new": _eval(x=_trait(True))}
+    assert pick_run(evals) == "new" and pick_per_trait(evals) == {"x": "new"}
+    assert pick_run({"old": old}) is None
+    text = format_table(evals)
+    assert [ln for ln in text.splitlines() if ln.startswith("old ")][0].split()[1] == "OLD"
+    assert "sbatch slurm/reeval.sbatch --out O --run-name old" in text
+
+
+def test_pending_lists_only_teacher_forced_failures():
+    chk = {"c=+1": {"random": {"kl_passed": False}}, "c=-1": {"random": {"kl_passed": True}}}
+    t = _trait(False, failed=["kl@c=+1", "length@c=+1", "random@c=+1", "random@c=-1", "judge@c=-1"], checks=chk)
+    row = format_table({"p": _pending(_eval(x=t))})
+    assert "PENDING (FAIL: kl@c=+1, random@c=+1)" in row

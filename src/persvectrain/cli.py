@@ -253,7 +253,7 @@ def cmd_eval(args) -> int:
         traits[slug] = TraitData(slug=slug, train=tr, held=held,
                                  start=start_vector(src, slug, cfg.layer, splits[slug]["train"]),
                                  source=full_source_vector(src, slug, cfg.layer))
-    ref_file = Path(meta["sources"].get("reference") or reference_path(cfg.out, cfg.model))
+    ref_file = Path(meta["sources"].get("reference") or reference_path(cfg.out, cfg.model, cfg.kl_tokens))
     refs = {r.id: r for r in load_reference(ref_file)}
     ref_held = [refs[i] for i in splits["reference"]["held"]]
     trained = load_trained(run_dir(cfg.out, cfg.run_name, cfg.model), cfg.traits, cfg.layer)

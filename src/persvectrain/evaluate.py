@@ -391,13 +391,17 @@ def fg_cols(r: dict | None) -> str:
 
 def pass_lines(res: dict) -> list[str]:
     """One `pass <trait>: PASS | FAIL (...)` line per trait, with the skipped checks and the free-gen status."""
-    status = res.get("free_gen", {}).get("status")
+    fg_status = res.get("free_gen", {}).get("status")
+    pj_status = (res.get("persona_judge") or {}).get("status")
     lines = []
     for s, t in res["traits"].items():
         p = t["pass"]
         line = f"pass {s}: " + ("PASS" if p["passed"] else "FAIL (" + ", ".join(p["failed"]) + ")")
         if p["skipped"]:
-            line += "; skipped: " + ", ".join(p["skipped"]) + f" (free generation {status})"
+            fgs = [x for x in p["skipped"] if not x.startswith(("judge@", "coherence@"))]
+            pjs = [x for x in p["skipped"] if x.startswith(("judge@", "coherence@"))]
+            line += "; skipped: " + ", ".join(p["skipped"]) + " (" + "; ".join(
+                ([f"free generation {fg_status}"] if fgs else []) + ([f"persona judge {pj_status}"] if pjs else [])) + ")"
         lines.append(line)
     return lines
 

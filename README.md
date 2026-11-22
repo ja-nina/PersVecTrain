@@ -151,7 +151,10 @@ KL by answer position (`kldepth`, HF on one GPU, after `freegen`):
     sbatch slurm/train.sbatch kldepth --out /scratch/inf0/user/nzukowsk/PersVecFast/out --run-name solo_kl1
 
 `report` shows a pending run's traits as PENDING, or `PENDING (FAIL: <checks>)` when a teacher-forced check
-already fails (free generation cannot make it pass); a pending run is never picked.
+already fails (free generation cannot make it pass; random@c counts only when its KL part failed); a pending run is never picked.
+An eval.json written before the current code (no `persona_judge` key, or free generation without `random_dirs`) is
+OLD: shown as `OLD` in every cell, listed under the table with the command
+`sbatch slurm/reeval.sbatch --out O --run-name R`, and never picked.
 
 `--no-free-gen` on `run.sbatch` (or `train`) skips free generation: the run's free_gen status is `disabled`, its
 length and accuracy checks are skipped (listed in `skipped`) and `report` shows it normally. Re-running `eval`
