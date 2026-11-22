@@ -177,7 +177,13 @@ async def _judge_all(judges: Judges, todo: list[dict], write, batch: int) -> int
             return {**line, "score": 0, "coherence": 0}
         s, c = await asyncio.gather(
             score_expression(judges, it["question"], it["text"], it["trait"], it["description"]),
-            score_coherence(judges, it["question"], it["text"]))
+            score_coherence(judges, it["question"], it["text"]), return_exceptions=True)
+        for r in (s, c):  # both calls have finished: no orphaned call; a JudgeError wins over other errors
+            if isinstance(r, JudgeError):
+                raise r
+        for r in (s, c):
+            if isinstance(r, BaseException):
+                raise r
         return {**line, "score": s, "coherence": c}
 
     n = 0
@@ -314,10 +320,15 @@ def run_persona(out: Path, run_name: str, max_tokens: int = MAX_TOKENS, open_eng
     per_trait = fold(plan, done, judged, slugs, qs)
 
     ev = read_json(root / "eval.json")  # re-read: `eval` may have rewritten it meanwhile
-    ev["persona_judge"] = {"status": "done", "judge_model": getattr(judges, "expression_model", JUDGE_MODEL),
+    n_unscored = len(unjudged(plan, judged))
+    ev["persona_judge"] = {"status": "done" if n_unscored == 0 else "pending", "judge_model": getattr(judges, "expression_model", JUDGE_MODEL),
                            "max_tokens": max_tokens, "n_questions": len(qs), "answers": str(answers_path.resolve()),
                            "judged": str(judged_path.resolve()), "random_dirs": RANDOM_DIRS,
-                           "n_unscored": sum(1 for k in unjudged(plan, judged))}
+                           "n_unscored": n_unscored}
+    if n_unscored:
+        log(f"persona {run_name}: WARNING {n_unscored} of {len(plan)} answers have no judge score (unparseable judge "
+            f"replies); persona_judge stays pending; rerun `python -m persvectrain persona --out {out} --run-name "
+            f"{run_name}` (only those are judged again)")
     for s in slugs:
         ev["traits"][s]["persona_judge"] = per_trait[s]
     apply_pass(ev, list(ev["traits"]))

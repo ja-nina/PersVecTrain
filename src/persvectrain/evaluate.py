@@ -84,13 +84,14 @@ def _correct_diff(fg: dict, a: str, b: str, c: str) -> tuple[float | None, float
     return mean_se([float(x) - float(y) for x, y in zip(xa, xb)])
 
 
-def _judge_diff(pj: dict, a: str, b: str, c: str, field: str) -> tuple[float | None, float | None]:
+def _judge_diff(pj: dict, a: str, b: str, c: str, field: str) -> tuple[float | None, float | None, int]:
     """Paired mean and SE over questions of field_a - field_b of the persona judge (field "score" or "coherence");
     a question with a None judge score in either kind is left out of that pair."""
     ba, bb = pj[a][c], pj[b][c]
     if ba["qid"] != bb["qid"]:
         raise ValueError(f"persona-judge answers of {a} and {b} at {c} are not paired: question ids differ")
-    return mean_se([float(x) - float(y) for x, y in zip(ba[field], bb[field]) if x is not None and y is not None])
+    diffs = [float(x) - float(y) for x, y in zip(ba[field], bb[field]) if x is not None and y is not None]
+    return (*mean_se(diffs), len(diffs))
 
 
 def pass_rule(trait_eval: dict) -> dict:
@@ -131,11 +132,12 @@ def pass_rule(trait_eval: dict) -> dict:
         else:
             skipped += [f"length@{c}", f"accuracy@{c}", f"random-length@{c}"]
         if pj:
-            m, se = _judge_diff(pj, *(("trained", "source_full") if c == "c=+1" else ("source_full", "trained")), c,
-                                "score")
-            ch["judge"] = {"passed": m is not None and m >= -(se or 0.0), "diff_mean": m, "diff_se": se}
-            m, se = _judge_diff(pj, "trained", "source_full", c, "coherence")
-            ch["coherence"] = {"passed": m is not None and m >= -(se or 0.0), "diff_mean": m, "diff_se": se}
+            m, se, n = _judge_diff(pj, *(("trained", "source_full") if c == "c=+1" else ("source_full", "trained")),
+                                   c, "score")
+            ch["judge"] = {"passed": m is not None and m >= -(se or 0.0), "diff_mean": m, "diff_se": se, "n_pairs": n}
+            m, se, n = _judge_diff(pj, "trained", "source_full", c, "coherence")
+            ch["coherence"] = {"passed": m is not None and m >= -(se or 0.0), "diff_mean": m, "diff_se": se,
+                               "n_pairs": n}
         else:
             skipped += [f"judge@{c}", f"coherence@{c}"]
         rnd["passed"] = rnd["kl_passed"] and rnd.get("length_passed", True)

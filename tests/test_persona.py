@@ -187,18 +187,34 @@ def test_judge_error_keeps_answers_and_rerun_judges_only_the_rest(prun, monkeypa
     assert ev["persona_judge"]["status"] == "done"
 
 
-def test_none_score_is_retried_on_rerun(prun, monkeypatch):
-    engine, _, world, oe, judges = _setup(monkeypatch)
-    world.none_for = {"answer xxx"}
+def test_none_scores_keep_status_pending_rc_1_and_rerun_resends_only_them(prun, monkeypatch, capsys):
+    def reply(r):
+        return ("answer xxx" if r.key[1] == "trained" else "answer x", 7, "stop")
+
+    engine, _, world, oe, judges = _setup(monkeypatch, reply)
+    world.none_for = {"answer xxx"}  # the trained answers get no score
     ev = _persona(prun, oe, judges)
-    t = ev["traits"]["calm"]["persona_judge"]["trained"]["c=+1"]
-    assert t["score"] == [None] * N_Q and t["score_mean"] is None and t["n_scored"] == 0
-    assert ev["traits"]["calm"]["pass"]["checks"]["c=+1"]["judge"]["passed"] is False  # no pairs: not passed
+    n_none = N_Q * 2 * 2  # trained, c = +-1, both traits
+    assert ev["persona_judge"]["status"] == "pending" and ev["persona_judge"]["n_unscored"] == n_none
+    t = ev["traits"]["calm"]["persona_judge"]
+    assert t["trained"]["c=+1"]["score"] == [None] * N_Q and t["trained"]["c=+1"]["n_scored"] == 0
+    assert t["source_full"]["c=+1"]["score"] == [1] * N_Q  # the scores so far stay
+    assert ev["traits"]["calm"]["pass"]["checks"]["c=+1"]["judge"]["n_pairs"] == 0
+    on_disk = json.loads((prun["root"] / "eval.json").read_text(encoding="utf-8"))
+    assert on_disk["persona_judge"]["status"] == "pending"
+    # the CLI exits 1 while some scores are missing
+    monkeypatch.setattr(cli, "run_persona", lambda out, run_name, **kw: pm.run_persona(
+        out, run_name, open_engine=oe, make_judges=judges, **kw))
+    args = cli.build_parser().parse_args(["persona", "--out", str(prun["out"]), "--run-name", "run1"])
+    assert cli.cmd_persona(args) == 1
+    # rerun with a working judge: only the None items are sent, then done and rc 0
     world.none_for = set()
     before = len(world.calls)
-    ev = _persona(prun, oe, judges)
-    assert len(world.calls) - before == N_Q * 2 * 8  # every None score judged again, nothing else
-    assert ev["traits"]["calm"]["persona_judge"]["trained"]["c=+1"]["score"] == [3] * N_Q
+    assert cli.cmd_persona(args) == 0
+    assert len(world.calls) - before == n_none
+    done = json.loads((prun["root"] / "eval.json").read_text(encoding="utf-8"))
+    assert done["persona_judge"]["status"] == "done" and done["persona_judge"]["n_unscored"] == 0
+    assert done["traits"]["calm"]["persona_judge"]["trained"]["c=+1"]["score"] == [3] * N_Q
 
 
 def test_resume_reuses_answers_and_fresh_regenerates(prun, monkeypatch):

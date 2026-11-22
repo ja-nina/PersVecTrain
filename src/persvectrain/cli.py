@@ -281,7 +281,7 @@ def _add_eval_flags(p: argparse.ArgumentParser) -> None:
 def cmd_persona(args) -> int:
     res = run_persona(Path(args.out), args.run_name, max_tokens=args.max_tokens, fresh=args.fresh,
                       judge_concurrency=args.judge_concurrency)
-    return 0 if res is not None else 1
+    return 0 if res is not None and res["persona_judge"]["status"] == "done" else 1
 
 
 # ---------------------------------------------------------------- freegen
