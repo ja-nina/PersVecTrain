@@ -76,7 +76,7 @@ def test_run_sbatch_runs_persona_after_freegen_unless_no_judge():
 def test_ablate_submits_reeval_for_existing_and_train_for_missing(tmp_path):
     out = tmp_path / "out"
     (out / "trained" / "solo_kl1").mkdir(parents=True)
-    (out / "trained" / "solo_kl1" / "train.json").write_text("{}", encoding="utf-8")
+    (out / "trained" / "solo_kl1" / "train.json").write_text('{"finished": true}', encoding="utf-8")
     stub = tmp_path / "stub.sh"
     log = tmp_path / "calls.log"
     stub.write_bytes(f'#!/bin/bash\necho "$@" >> "{log.as_posix()}"\necho 7\n'.encode())
@@ -98,3 +98,58 @@ def test_ablate_submits_reeval_for_existing_and_train_for_missing(tmp_path):
         assert "--dependency=afterok:7" in runs[name] and "--kl-tokens 2048" in runs[name]
     assert "--lambda-kl 3" in runs["solo_kl3"] and "--beta 0.01" in runs["solo_kl3"] and "-p x" in runs["solo_kl3"]
     assert "--per-trait" in r.stdout and "solo_kl1_t2048" in r.stdout
+
+
+def _ablate(tmp_path, extra_env=None, setup=None):
+    out = tmp_path / "out"
+    (out / "trained").mkdir(parents=True, exist_ok=True)
+    for run, fin in (setup or {}).items():
+        (out / "trained" / run).mkdir(parents=True, exist_ok=True)
+        (out / "trained" / run / "train.json").write_text('{"finished": %s}' % fin, encoding="utf-8")
+    stub = tmp_path / "stub.sh"
+    log = tmp_path / "calls.log"
+    stub.write_bytes(f'#!/bin/bash\necho "$@" >> "{log.as_posix()}"\necho 7\n'.encode())
+    env = {**os.environ, "SBATCH": stub.as_posix(), "OUT": out.as_posix(), "SOURCE": "/src", "LAMBDAS": "1",
+           "SQUEUE": "true", **(extra_env or {})}
+    r = subprocess.run([BASH, str(SLURM / "ablate.sh"), "m", "12"], capture_output=True, text=True, cwd=tmp_path,
+                       env=env)
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return r, calls, out
+
+
+def test_ablate_reference_present_no_reference_call_no_dependency(tmp_path):
+    (tmp_path / "out" / "trained" / "reference").mkdir(parents=True)
+    (tmp_path / "out" / "trained" / "reference" / "m_pool260_t2048.jsonl").write_text("", encoding="utf-8")
+    r, calls, _ = _ablate(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert len(calls) == 2 and not any("train.sbatch reference" in c for c in calls) and not any("--dependency" in c for c in calls)
+
+
+def test_ablate_empty_train_extra_has_no_beta(tmp_path):
+    r, calls, _ = _ablate(tmp_path, {"TRAIN_EXTRA": ""})
+    assert r.returncode == 0, r.stderr
+    assert calls and not any("--beta" in c for c in calls)
+
+
+def test_ablate_unfinished_run_skipped_with_warning(tmp_path):
+    r, calls, _ = _ablate(tmp_path, setup={"solo_kl1": "false"})
+    assert r.returncode == 0, r.stderr
+    assert "run solo_kl1 not finished (still running or killed): skipped" in r.stdout
+    assert not any("--run-name solo_kl1 " in c + " " or c.endswith("--run-name solo_kl1") for c in calls)
+    assert any("solo_kl1_t2048" in c for c in calls)
+
+
+def test_ablate_no_reference_when_every_window_run_exists(tmp_path):
+    r, calls, _ = _ablate(tmp_path, setup={"solo_kl1": "true", "solo_kl1_t2048": "true"})
+    assert r.returncode == 0, r.stderr
+    assert len(calls) == 2 and all("reeval.sbatch" in c for c in calls)
+
+
+def test_ablate_refuses_while_pvt_jobs_queued_unless_forced(tmp_path):
+    q = tmp_path / "q.sh"
+    q.write_bytes(b"#!/bin/bash\necho pvt\n")
+    r, calls, _ = _ablate(tmp_path, {"SQUEUE": q.as_posix()})
+    assert r.returncode == 1 and "pvt jobs are still queued/running" in r.stderr and calls == []
+    (tmp_path / "f").mkdir()
+    r, calls, _ = _ablate(tmp_path / "f", {"SQUEUE": q.as_posix(), "FORCE": "1"})
+    assert r.returncode == 0 and calls

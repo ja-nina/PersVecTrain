@@ -166,7 +166,9 @@ runs) and `solo_kl{L}_t2048`. One script submits it: a `reference --max-new-toke
 missing, a train + freegen + persona job (`run.sbatch`, after the reference job for the 2048 runs) for every run
 without a `train.json`, and a `reeval.sbatch` job (`eval`, `freegen`, `persona` in place, no retraining) for every
 existing run. `KL_TOKENS`, `LAMBDAS`, `TRAITS`, `TRAIN_EXTRA` (default `--beta 0.01`), `SOURCE`, `OUT` override the
-defaults.
+defaults. Re-run `ablate.sh` only after earlier jobs have finished: it refuses while `pvt` jobs are in the
+queue (`FORCE=1` overrides), skips a run whose `train.json` says `finished: false` (still training or killed; check
+`squeue`, rerun under a new name) and re-evaluates only finished runs.
 
     bash slurm/ablate.sh qwen3.5-2b 12 -p gpu-l40 --gres=gpu:1 -c 10 --mem=64G
 
