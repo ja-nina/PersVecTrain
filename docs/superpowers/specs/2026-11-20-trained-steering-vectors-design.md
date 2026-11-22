@@ -258,6 +258,15 @@ without the key is not pending); per trait `persona_judge = {"unsteered": B, "el
 "c=-1": B}}` with B = per-question lists `qid`, `score`, `coherence`, `n_tokens` and `score_mean` / `score_se` /
 `coherence_mean` / `coherence_se`. The pass rule's judge and coherence checks (above) are recomputed.
 
+## Ablation (added 2026-11-22)
+
+Grid lambda_kl in {1, 3, 5, 10} x KL window in {512, 2048}; names `solo_kl{L}` (512) and `solo_kl{L}_t{N}`.
+`slurm/ablate.sh <model> <layer>` submits it: a reference job per missing `_t{N}` file, `run.sbatch` for runs
+without a train.json, `reeval.sbatch` (`eval`, `freegen`, `persona`) for existing runs. `report --per-trait` prints,
+per trait, the non-pending run where the trait passes with the largest mean trained margin at c = +-1 (ties: first
+listed; none -> "none passes"); `--write-profile P` writes `{trait: {"run", "vector"}}` with the run's vllm_hook
+vector file (null for no pick).
+
 ## Left to the builder
 
 Optimiser and learning rate, batch composition, steps / epochs, whether the vector's norm is free or bounded

@@ -159,6 +159,30 @@ on such a run without `--no-free-gen` makes it `pending` again. A run trained be
 `pending` from the old Hugging Face path, or with Hugging Face free-gen results) must be rerun under a new
 `--run-name`.
 
+## Ablation
+
+The grid lambda_kl (1, 3, 5, 10) x KL window (512, 2048 answer tokens): runs `solo_kl{L}` (window 512, the existing
+runs) and `solo_kl{L}_t2048`. One script submits it: a `reference --max-new-tokens 2048` job when its file is
+missing, a train + freegen + persona job (`run.sbatch`, after the reference job for the 2048 runs) for every run
+without a `train.json`, and a `reeval.sbatch` job (`eval`, `freegen`, `persona` in place, no retraining) for every
+existing run. `KL_TOKENS`, `LAMBDAS`, `TRAITS`, `TRAIN_EXTRA` (default `--beta 0.01`), `SOURCE`, `OUT` override the
+defaults.
+
+    bash slurm/ablate.sh qwen3.5-2b 12 -p gpu-l40 --gres=gpu:1 -c 10 --mem=64G
+
+When all jobs have finished (the script prints this command with every run), the table plus the best run per trait,
+and a profile `{trait: {run, vector}}` of the picked runs' vector files (null for a trait no run passes):
+
+    python -m persvectrain report --out /scratch/inf0/user/nzukowsk/PersVecFast/out         --runs solo_kl1 solo_kl3 solo_kl5 solo_kl10 solo_kl1_t2048 solo_kl3_t2048 solo_kl5_t2048 solo_kl10_t2048         --per-trait --write-profile profile.json
+
+`persona` alone (vLLM answers and the judge, for a run whose persona step failed or was skipped; it resumes and
+only judges what is missing):
+
+    sbatch slurm/train.sbatch persona --out /scratch/inf0/user/nzukowsk/PersVecFast/out --run-name solo_kl1
+
+The judge needs `OPENROUTER_API_KEY` in the environment or in PersVecFast's `.env`; `persona` checks it before
+generating anything.
+
 ## Using the output in MA_Environments
 
 For the games (stage 3), steer from the run's vector dir:

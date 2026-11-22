@@ -26,6 +26,32 @@ def mean_trained_margin(ev: dict) -> float:
     return sum(per_trait) / len(per_trait) if per_trait else float("-inf")
 
 
+def trait_margin(trait_eval: dict) -> float:
+    """Mean of one trait's trained persona margin at c=+1 and c=-1 (-inf without any)."""
+    ms = [trait_eval["kinds"]["trained"][c]["margin_mean"] for c in _MARGIN_CS]
+    ms = [m for m in ms if m is not None]
+    return sum(ms) / len(ms) if ms else float("-inf")
+
+
+def pick_per_trait(evals: dict[str, dict]) -> dict[str, str | None]:
+    """Per trait (union over runs, first-seen order): the non-pending run where the trait passes with the largest
+    mean trained margin at c=+-1 (ties: first listed); None where it passes in no run."""
+    traits: list[str] = []
+    for ev in evals.values():
+        traits += [t for t in ev["traits"] if t not in traits]
+    out: dict[str, str | None] = {}
+    for t in traits:
+        best, best_m = None, None
+        for name, ev in evals.items():
+            if is_pending(ev) or t not in ev["traits"] or not ev["traits"][t]["pass"]["passed"]:
+                continue
+            m = trait_margin(ev["traits"][t])
+            if best_m is None or m > best_m:
+                best, best_m = name, m
+        out[t] = best
+    return out
+
+
 def pick_run(evals: dict[str, dict]) -> str | None:
     """The run passing the most traits (ties: larger mean trained margin, then first listed); None if none pass.
     Runs with pending free generation are never picked."""

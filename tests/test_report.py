@@ -105,3 +105,30 @@ def test_report_pending_run_shows_teacher_forced_failures():
     assert "PENDING (FAIL: kl@c=+1, persona@c=-1)" in row and row.count("PENDING") == 2
     assert "PASS" not in row
     assert pick_run({"pend": ev}) is None
+
+
+def test_pick_per_trait():
+    from persvectrain.report import pick_per_trait
+    pend = _eval(x=_trait(True, 9.0))
+    pend["free_gen"] = {"status": "pending"}
+    evals = {"p": pend,
+             "a": _eval(x=_trait(True, 1.0), y=_trait(False), z=_trait(False)),
+             "b": _eval(x=_trait(True, 2.0), y=_trait(True, 0.5), z=_trait(False)),
+             "c": _eval(x=_trait(True, 2.0), y=_trait(True, 0.5), z=_trait(False))}
+    assert pick_per_trait(evals) == {"x": "b", "y": "b", "z": None}
+
+
+def test_report_per_trait_writes_profile(tmp_path, capsys):
+    from persvectrain.output import run_dir
+    ev = _eval(x=_trait(True, 1.0), y=_trait(False))
+    ev.update(model="m", layer=12)
+    (tmp_path / "trained" / "r1").mkdir(parents=True)
+    (tmp_path / "trained" / "r1" / "eval.json").write_text(json.dumps(ev), encoding="utf-8")
+    prof = tmp_path / "profile.json"
+    rc = cli.main(["report", "--out", str(tmp_path), "--runs", "r1", "--per-trait", "--write-profile", str(prof)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "x -> r1" in out and "y -> none passes" in out
+    data = json.loads(prof.read_text(encoding="utf-8"))
+    assert data["y"] is None and data["x"]["run"] == "r1"
+    assert Path(data["x"]["vector"]) == run_dir(tmp_path, "r1", "m") / "vllm_hook" / "x_L12.pt"

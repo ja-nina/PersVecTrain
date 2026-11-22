@@ -25,7 +25,7 @@ from persvectrain.generate import generate as _generate
 from persvectrain.output import (PERSVECFAST_REPO, REPO, build_train_json, config_from_train_json, git_commit,
                                  load_reference, load_trained, prepare_run, run_dir, run_root, source_dir,
                                  write_vectors)
-from persvectrain.report import format_table, pick_run
+from persvectrain.report import format_table, pick_per_trait, pick_run
 from persvectrain.steering import LOGPROB_NORMS, layer_type
 from persvectrain.train import RefAnswer, TrainConfig, TraitData, train
 
@@ -325,6 +325,22 @@ def cmd_report(args) -> int:
         print(format_table(evals))
     best = pick_run(evals)
     print(f"picked: {best}" if best else "no run passes")
+    if args.per_trait or args.write_profile:
+        picks = pick_per_trait(evals)
+        for trait, run in picks.items():
+            print(f"{trait} -> {run}" if run else f"{trait} -> none passes")
+        if args.write_profile:
+            from persvecfast.extract import vector_file
+            profile = {}
+            for trait, run in picks.items():
+                if run is None:
+                    profile[trait] = None
+                    continue
+                ev = evals[run]
+                vec = vector_file(run_dir(Path(args.out), run, ev["model"]), trait, ev["layer"])
+                profile[trait] = {"run": run, "vector": str(vec)}
+            write_json(Path(args.write_profile), profile)
+            print(f"wrote {args.write_profile}")
     return 0
 
 
@@ -423,6 +439,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("report", help="pass/fail table over runs and the best run")
     p.add_argument("--out", required=True, help="out root holding trained/<run>/eval.json")
     p.add_argument("--runs", nargs="+", required=True)
+    p.add_argument("--per-trait", action="store_true", dest="per_trait",
+                   help="also the best run per trait (passing, largest mean trained margin at c=+-1)")
+    p.add_argument("--write-profile", default=None, dest="write_profile",
+                   help="write {trait: {run, vector}} (null where no run passes) to this json file")
     p.set_defaults(func=cmd_report)
     return parser
 
