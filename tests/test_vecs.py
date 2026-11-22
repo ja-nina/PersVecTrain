@@ -69,6 +69,9 @@ def test_cli_vecs_without_and_with_model(two_runs, monkeypatch, capsys):
     r = res["runs"]["run1"]
     assert set(r["per_trait"]) == {"assertive", "calm"} and len(r["delta_perp"]["sv_share"]) == 2
     assert set(res["across_runs"]["run1 vs run2"]["delta_cos"]) == {"assertive", "calm"}
+    bm = res["across_runs"]["run1 vs run2"]["b_minus_a"]
+    assert set(bm["rel"]) == {"assertive", "calm"} and len(bm["shared_perp"]["sv_share"]) == 2
+    assert "second - first" in text
     after = {p: p.read_bytes() for p in out.rglob("*") if p.is_file()}
     assert set(after) - set(before) == {path} and all(after[p] == b for p, b in before.items())  # reads only
 

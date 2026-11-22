@@ -115,9 +115,20 @@ def analyse(runs: dict[str, dict[str, tuple]]) -> dict:
     for i, a in enumerate(names):
         for b in names[i + 1:]:
             da, db = res["runs"][a]["_deltas"], res["runs"][b]["_deltas"]
+            common = [s for s in da if s in db]
+            # the change from run a to run b (same start, same pairs and seed: what the other KL weight adds)
+            diff = {s: (db[s] - da[s]) for s in common}
+            s0 = {s: runs[a][s][0].float() for s in common}
+            dsh = shared({s: perp(diff[s], s0[s]) for s in common}) if len(common) > 1 else None
+            if dsh:
+                dsh.pop("u1")
             res["across_runs"][f"{a} vs {b}"] = {
-                "delta_cos": {s: cos(da[s], db[s]) for s in da if s in db},
-                "u1_cos": cos(res["runs"][a]["_u1"], res["runs"][b]["_u1"])}
+                "delta_cos": {s: cos(da[s], db[s]) for s in common},
+                "u1_cos": cos(res["runs"][a]["_u1"], res["runs"][b]["_u1"]),
+                "b_minus_a": {"rel": {s: float(diff[s].norm() / s0[s].norm()) for s in common},
+                              "along_start_rel": {s: float(diff[s] @ unit(s0[s])) / float(s0[s].norm())
+                                                  for s in common},
+                              "shared_perp": dsh}}
     return res
 
 
@@ -241,4 +252,12 @@ def format_vecs(res: dict) -> str:
     for pair, x in res["across_runs"].items():
         L.append(f"== {pair}: u1 cos {x['u1_cos']:+.3f}; per-trait delta cos "
                  + ", ".join(f"{s} {c:+.2f}" for s, c in x["delta_cos"].items()))
+        bm = x["b_minus_a"]
+        L.append("   second - first (rel. |s0|): " + ", ".join(
+            f"{s} {bm['rel'][s]:.2f} (along {bm['along_start_rel'][s]:+.2f})" for s in bm["rel"]))
+        if bm["shared_perp"]:
+            sp = bm["shared_perp"]
+            L.append(f"   its orthogonal part across traits: mean cos {sp['mean_cos']:+.3f}, mean |cos| "
+                     f"{sp['mean_abs_cos']:.3f}, 1st share {sp['sv_share'][0]:.3f}; along its u1: "
+                     + ", ".join(f"{s} {c:+.2f}" for s, c in sp["u1_cos"].items()))
     return "\n".join(L)
