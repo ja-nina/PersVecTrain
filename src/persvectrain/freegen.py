@@ -33,8 +33,8 @@ from persvectrain.train import RefAnswer, TrainConfig
 
 POOL = REPO / "data" / "supergpqa_pool.jsonl"
 MAX_TOKENS = 15360  # the games' max_tokens
-REFERENCE_SUFFIX = "_pool260.jsonl"
-REFERENCE_NAME_RE = re.compile(r"_pool260(_t\d+)?\.jsonl$")  # a longer / shorter KL window adds _t{N}  # cli.reference_path: the reference answers of the 260-question pool
+REFERENCE_SUFFIX = "_pool260.jsonl"  # the 260-question pool's reference answers (cli.reference_path)
+REFERENCE_NAME_RE = re.compile(r"_pool260(_t\d+)?\.jsonl$")  # a longer / shorter KL window adds _t{N}
 UNSTEERED = "unsteered"
 ANSWERS_FILE = "freegen_answers.jsonl.gz"  # in run_root: every saved answer, one gzip member per chunk
 SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty", "presence_penalty")

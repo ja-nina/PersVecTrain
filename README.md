@@ -26,6 +26,13 @@ PersVecFast (extracted responses and activations) and imports its `persvecfast` 
   directions (files `freegen_vectors/{slug}_trained_random_k0..4.pt`; question i of the held list uses k = i % 5);
   teacher-forced eval averages the same 5 at c = +-1. Answer lines record the vector file name, and saved
   `trained_random` answers without it (old runs) are regenerated on the next `freegen`
+- `persona --out O --run-name R [--max-tokens 1024] [--judge-concurrency 32] [--fresh]` - persona answers of a
+  finished run on vLLM (unsteered, elicited, and per trait trained / source_full / trained_random at c = +1 neutral
+  and c = -1 eliciting prompt) scored by PersVecFast's OpenRouter judge; the key is `OPENROUTER_API_KEY` from the
+  environment or `PersVecFast/.env` (checked before anything runs). Fills eval.json's `persona_judge` block and adds
+  the judge / coherence checks to the pass rule; resumes (`persona_answers.jsonl.gz`, `persona_judged.jsonl.gz`),
+  a judge outage keeps the answers and the rerun judges only what is missing. `train --no-judge` (also `eval`) turns
+  it off for a run (status disabled)
 - `kldepth --out O --run-name R` - diagnostic, after `freegen`: KL(unsteered || steered) by answer position
   (tokens 0-512, 512-2048, 2048-4096, 4096-8192) on the run's saved unsteered free answers, teacher-forced, per
   trait x trained / source_full / trained_random x c = +-1, plus the paired source_full - trained per bucket.
@@ -68,8 +75,8 @@ before the letter), X one of the question's option letters and not followed by a
 
 All paths are the shared PersVecFast output root. Run everything from the PersVecTrain checkout. `train` runs on
 Hugging Face (teacher-forced evaluation); free generation is a separate `freegen` step on vLLM (PersVecFast's
-steer engine), run in the same job by `slurm/run.sbatch` (two processes, so the HF model's GPU memory is freed
-first). A run is `pending` until its `freegen` has finished: `report` shows it as PENDING and never picks it.
+steer engine), run in the same job by `slurm/run.sbatch` (separate processes, so the HF model's GPU memory is freed
+first), followed by `persona` unless `--no-judge`. A run is `pending` until its `freegen` and `persona` have finished: `report` shows it as PENDING and never picks it.
 
 Update:
 

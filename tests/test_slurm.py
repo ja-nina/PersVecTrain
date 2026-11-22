@@ -63,3 +63,10 @@ def test_sweep_exports_lib_path_from_any_cwd(tmp_path):
     assert len(libs) == 5 and len(set(libs)) == 1
     r = subprocess.run([BASH, "-c", f'[ -f "{libs[0]}" ] && cmp -s "{libs[0]}" "{(SLURM / "lib.sh").as_posix()}"'])
     assert r.returncode == 0, libs[0]
+
+
+def test_run_sbatch_runs_persona_after_freegen_unless_no_judge():
+    text = " ".join((SLURM / "run.sbatch").read_text(encoding="utf-8").split())
+    assert text.index("persvectrain freegen") < text.index("persvectrain persona")
+    assert '-m persvectrain persona --out "$OUT" --run-name "$RUN_NAME"' in text
+    assert 'pvt_has_flag --no-judge "$@"' in text and 'pvt_has_flag --no-free-gen "$@"' in text

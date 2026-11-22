@@ -52,7 +52,8 @@ def test_pass_rule_all_better_passes():
     te = _trait_eval([2, 3, 4, 5], [1, 2, 3, 4], [0.1, 0.2, 0.1, 0.2], [1.0, 1.1, 0.9, 1.0],
                      [0.5, 0.6, 0.5, 0.6], GOOD_TOKENS)
     r = ev.pass_rule(te)
-    assert r["passed"] is True and r["failed"] == [] and r["skipped"] == []
+    assert r["passed"] is True and r["failed"] == []
+    assert r["skipped"] == ["judge@c=+1", "coherence@c=+1", "judge@c=-1", "coherence@c=-1"]  # no persona judge
     assert set(r["checks"]) == {"c=+1", "c=-1"}
     assert set(r["checks"]["c=+1"]) == {"persona", "kl", "length", "accuracy", "random"}
     assert all(chk["passed"] for c in r["checks"].values() for chk in c.values())
@@ -150,8 +151,8 @@ def test_pass_rule_without_free_gen_skips_length():
     te = _trait_eval([2] * 4, [1] * 4, [0.1] * 4, [1.0] * 4, [0.5] * 4, None)
     r = ev.pass_rule(te)
     assert r["passed"] is True
-    assert r["skipped"] == ["length@c=+1", "accuracy@c=+1", "random-length@c=+1",
-                            "length@c=-1", "accuracy@c=-1", "random-length@c=-1"]
+    assert r["skipped"] == ["length@c=+1", "accuracy@c=+1", "random-length@c=+1", "judge@c=+1", "coherence@c=+1",
+                            "length@c=-1", "accuracy@c=-1", "random-length@c=-1", "judge@c=-1", "coherence@c=-1"]
     assert "length" not in r["checks"]["c=+1"] and "accuracy" not in r["checks"]["c=+1"]
 
 
@@ -333,12 +334,77 @@ def test_evaluate_keeps_previous_free_gen_block(tiny_model, char_tok, tmp_path):
     assert res["free_gen"] == previous["free_gen"] and res["timing"]["free_gen_s"] == 12.5
     t = res["traits"]["t1"]
     assert t["free_gen"] == previous["traits"]["t1"]["free_gen"]
-    assert t["pass"]["skipped"] == [] and "accuracy" in t["pass"]["checks"]["c=+1"]
+    assert t["pass"]["skipped"] == ["judge@c=+1", "coherence@c=+1", "judge@c=-1", "coherence@c=-1"]
+    assert "accuracy" in t["pass"]["checks"]["c=+1"]
     assert t["kinds"]["trained"]["c=+1"]["margins"] == first["traits"]["t1"]["kinds"]["trained"]["c=+1"]["margins"]
     # free_gen False: the previous block is dropped
     res = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2), free_gen=False,
                       previous=previous)
     assert res["free_gen"]["status"] == "disabled" and "free_gen" not in res["traits"]["t1"]
+
+
+def _pj_block(score, coherence=None) -> dict:
+    n = len(score)
+    return {"qid": [f"q{i}" for i in range(n)], "score": list(score), "coherence": list(coherence or [50] * n)}
+
+
+def _judge_eval(trained, source, c_trained=None, c_source=None) -> dict:
+    """Persona-judge blocks with the same trained / source scores at c = +1 and -1."""
+    te = _trait_eval([2] * 4, [1] * 4, [0.1] * 4, [1.0] * 4, [0.5] * 4, GOOD_TOKENS)
+    te["persona_judge"] = {k: {c: _pj_block(v, cv) for c in ("c=+1", "c=-1")}
+                           for k, v, cv in (("trained", trained, c_trained), ("source_full", source, c_source),
+                                            ("trained_random", [0] * len(trained), None))}
+    return te
+
+
+def test_pass_rule_judge_ties_within_one_se_and_beyond():
+    # trained - source at +1: -10, 0, +10, -10 -> mean -2.5, SE about 4.8: a tie, passes
+    r = ev.pass_rule(_judge_eval([40, 50, 60, 40], [50, 50, 50, 50]))
+    j = r["checks"]["c=+1"]["judge"]
+    assert j["diff_mean"] == pytest.approx(-2.5) and -j["diff_se"] <= j["diff_mean"] < 0
+    # c = -1 uses source - trained: +2.5, passes
+    assert j["passed"] and r["checks"]["c=-1"]["judge"]["diff_mean"] == pytest.approx(2.5)
+    assert r["passed"] is True and r["skipped"] == []
+    # beyond 1 SE: trained expresses clearly less at +1, and (source - trained = +20) suppresses fine at -1
+    r = ev.pass_rule(_judge_eval([30, 31, 29, 30], [50, 50, 50, 50]))
+    assert r["failed"] == ["judge@c=+1"] and r["checks"]["c=-1"]["judge"]["passed"] is True
+    # suppression: trained scoring above the source at -1 fails
+    r = ev.pass_rule(_judge_eval([70, 71, 69, 70], [50, 50, 50, 50]))
+    assert r["failed"] == ["judge@c=-1"]
+
+
+def test_pass_rule_coherence_check_and_none_scores():
+    r = ev.pass_rule(_judge_eval([50] * 4, [50] * 4, c_trained=[20, 21, 19, 20], c_source=[60] * 4))
+    assert r["failed"] == ["coherence@c=+1", "coherence@c=-1"]
+    # a None score drops that question from the pair (3 pairs left, all -10 -> beyond 1 SE of 0)
+    te = _judge_eval([40, 40, 40, 40], [50, 50, 50, 50])
+    te["persona_judge"]["trained"]["c=+1"]["score"][0] = None
+    j = ev.pass_rule(te)["checks"]["c=+1"]["judge"]
+    assert j["diff_mean"] == -10 and j["passed"] is False
+    # kinds with different questions are not paired
+    te["persona_judge"]["trained"]["c=+1"]["qid"] = ["x"] * 4
+    with pytest.raises(ValueError):
+        ev.pass_rule(te)
+
+
+def test_evaluate_persona_judge_status_and_keep(tiny_model, char_tok, tmp_path):
+    cfg = _cfg(tmp_path)
+    td = _trait("t1", 1)
+    first = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2))
+    assert first["persona_judge"] == {"status": "pending"}
+    off = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2), persona_judge=False)
+    assert off["persona_judge"] == {"status": "disabled"}
+    previous = json.loads(json.dumps(first))
+    previous["persona_judge"] = {"status": "done", "max_tokens": 1024, "n_questions": 4}
+    previous["traits"]["t1"]["persona_judge"] = _judge_eval([50] * 4, [50] * 4)["persona_judge"]
+    previous["timing"]["persona_s"] = 7.5
+    res = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2), previous=previous)
+    assert res["persona_judge"] == previous["persona_judge"] and res["timing"]["persona_s"] == 7.5
+    assert res["traits"]["t1"]["persona_judge"] == previous["traits"]["t1"]["persona_judge"]
+    # a previous disabled block does not stay: the re-run is pending again
+    previous["persona_judge"] = {"status": "disabled"}
+    res = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2), previous=previous)
+    assert res["persona_judge"] == {"status": "pending"}
 
 
 def test_eval_without_free_gen_status_disabled(tiny_model, char_tok, tmp_path):

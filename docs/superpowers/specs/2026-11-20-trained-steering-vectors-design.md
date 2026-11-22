@@ -153,6 +153,12 @@ what helps?" ablation, then e.g. 0.1, 1, 10); its value is not fixed in this des
    - its reasoning cost (KL, length change, accuracy change) is **no worse than its own random twin's** (random
      direction, same norm as the trained vector; from 2026-11-22 the twin's KL is the mean over 5 random directions
      and its free-answer length comes from the rotation below; the form of the check is unchanged).
+   - *(Updated 2026-11-22: persona judge.)* Judged persona answers (`persona_judge`, "Persona judge" below), paired
+     by question, ties within 1 SE: at c = +1 the trained vector's judge expression score is **at least** the
+     source's (judge@+1); at c = -1 (under the eliciting prompt) it **suppresses at least as much** (judge@-1,
+     score_source - score_trained >= -SE); and its judge coherence is at least the source's (coherence@c). A question
+     with a None judge score in either kind is left out of the pair. Without judge results (status pending or
+     disabled) these checks are skipped and listed in the trait's `pass.skipped`.
    *(Calls made by me.)* Held-out is small, so "at least as much" / "no worse" count a difference within 1 SE as a
    tie. A run's eval.json says pass / fail per trait and per check. Among the swept lambda_kl values, the one that
    passes for the most traits moves on to stages 2 and 3 (ties: the larger mean persona margin). If none passes for
@@ -225,6 +231,32 @@ question at position i of the held list (train.json's order) uses direction k = 
 steered request carries the vector file name; a saved `trained_random` line is reused on resume only when its name is
 the expected one (older lines without it are regenerated). The per-trait free-gen block of `trained_random` lists the
 direction of each item (`"direction"`).
+
+## Persona judge (added 2026-11-22)
+
+`persona --out O --run-name R` answers the run's held persona questions on vLLM and scores them with PersVecFast's
+OpenRouter judge (`persvecfast.judge`, expression model `openai/gpt-oss-120b`, temperature 0; key `OPENROUTER_API_KEY`
+from the environment or PersVecFast's `.env`, checked before the engine opens). Questions: the union of every trait's
+held pair questions (train.json splits), by trait (config order) then pair index, qid `"{slug}:{index}"`; the same
+list for every trait. Per trait and question: `unsteered` (neutral system prompt), `elicited` (PersVecFast's
+`positive_instruction(trait, False)` as system prompt, no steering), and `trained`, `source_full`, `trained_random` at
+c = +1 under the neutral prompt and at c = -1 under the eliciting prompt (PersVecFast's suppression setting).
+Thinking off, up to 1024 new tokens (`--max-tokens`). Seeds `request_seed(seed, "persona", c, qi)` for steered
+requests (paired across kinds and traits), `"neutral"` / `"elicited"` instead of c unsteered. `trained_random` rotates
+the 5 directions by question position (k = i % 5, as in `freegen`). The judge gives a trait-expression score and a
+coherence score (0-100); an empty answer gets 0 / 0 without a call; a None score (unparseable reply) is excluded
+from means and paired differences and retried on rerun.
+
+Answers are appended per engine chunk to `persona_answers.jsonl.gz` (the freegen line format), scores per judge batch
+to `persona_judged.jsonl.gz` (lines: key, seed, score, coherence, plus max_tokens and vector; the last line per key
+wins). Both resume. A judge error retrying cannot fix (no credit, bad key) stops the job with a message and keeps both
+files; a rerun sends only the unjudged answers.
+
+eval.json: top-level `persona_judge = {"status": "pending" | "done" | "disabled", "judge_model", "max_tokens",
+"n_questions", ...}` (`train` writes pending, or disabled with `--no-judge`; `eval` keeps an existing block; a run
+without the key is not pending); per trait `persona_judge = {"unsteered": B, "elicited": B, kind: {"c=+1": B,
+"c=-1": B}}` with B = per-question lists `qid`, `score`, `coherence`, `n_tokens` and `score_mean` / `score_se` /
+`coherence_mean` / `coherence_se`. The pass rule's judge and coherence checks (above) are recomputed.
 
 ## Left to the builder
 

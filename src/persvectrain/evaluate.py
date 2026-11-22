@@ -84,6 +84,15 @@ def _correct_diff(fg: dict, a: str, b: str, c: str) -> tuple[float | None, float
     return mean_se([float(x) - float(y) for x, y in zip(xa, xb)])
 
 
+def _judge_diff(pj: dict, a: str, b: str, c: str, field: str) -> tuple[float | None, float | None]:
+    """Paired mean and SE over questions of field_a - field_b of the persona judge (field "score" or "coherence");
+    a question with a None judge score in either kind is left out of that pair."""
+    ba, bb = pj[a][c], pj[b][c]
+    if ba["qid"] != bb["qid"]:
+        raise ValueError(f"persona-judge answers of {a} and {b} at {c} are not paired: question ids differ")
+    return mean_se([float(x) - float(y) for x, y in zip(ba[field], bb[field]) if x is not None and y is not None])
+
+
 def pass_rule(trait_eval: dict) -> dict:
     """The strict pass rule at c = +1 and c = -1 (spec). Differences within 1 SE (paired) count as ties.
 
@@ -93,9 +102,13 @@ def pass_rule(trait_eval: dict) -> dict:
     mean(correct_trained - correct_source_full) >= -SE (a tie passes "at least as accurate"); random:
     mean(trained_random - trained KL) >= -SE and mean(shift_random - shift_trained) >= -SE (a tie passes "no
     worse"). Without free-generation results (status pending or disabled) the length and accuracy parts are
-    skipped (named in "skipped").
+    skipped (named in "skipped"). Persona judge (`persona`, trait_eval["persona_judge"]; skipped when absent), paired
+    over questions with None scores left out, ties within 1 SE: judge@+1 mean(score_trained - score_source_full)
+    >= -SE (expresses the trait at least as much), judge@-1 mean(score_source_full - score_trained) >= -SE (trained
+    suppresses at least as much), coherence@c mean(coherence_trained - coherence_source_full) >= -SE.
     """
     fg = trait_eval.get("free_gen")
+    pj = trait_eval.get("persona_judge")
     checks: dict = {}
     failed: list[str] = []
     skipped: list[str] = []
@@ -117,9 +130,17 @@ def pass_rule(trait_eval: dict) -> dict:
             rnd.update(length_passed=m is not None and m >= -(se or 0.0), length_diff_mean=m, length_diff_se=se)
         else:
             skipped += [f"length@{c}", f"accuracy@{c}", f"random-length@{c}"]
+        if pj:
+            m, se = _judge_diff(pj, *(("trained", "source_full") if c == "c=+1" else ("source_full", "trained")), c,
+                                "score")
+            ch["judge"] = {"passed": m is not None and m >= -(se or 0.0), "diff_mean": m, "diff_se": se}
+            m, se = _judge_diff(pj, "trained", "source_full", c, "coherence")
+            ch["coherence"] = {"passed": m is not None and m >= -(se or 0.0), "diff_mean": m, "diff_se": se}
+        else:
+            skipped += [f"judge@{c}", f"coherence@{c}"]
         rnd["passed"] = rnd["kl_passed"] and rnd.get("length_passed", True)
         ch["random"] = rnd
-        failed += [f"{name}@{c}" for name in ("persona", "kl", "length", "accuracy", "random")
+        failed += [f"{name}@{c}" for name in ("persona", "kl", "length", "accuracy", "random", "judge", "coherence")
                    if name in ch and not ch[name]["passed"]]
         checks[c] = ch
     return {"checks": checks, "failed": failed, "passed": not failed, "skipped": skipped}
@@ -260,14 +281,17 @@ def _joint(model, cfg: TrainConfig, slugs: list[str], vecs: dict, held: dict, tr
 
 
 def evaluate(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], trained: dict[str, Tensor],
-             kl_held: list[RefAnswer], free_gen: bool = True, previous: dict | None = None) -> dict:
+             kl_held: list[RefAnswer], free_gen: bool = True, previous: dict | None = None,
+             persona_judge: bool = True) -> dict:
     """Evaluate every trained vector on held-out data (teacher-forced); writes eval.json in the run root and
     prints the table. No free generation here: free_gen status "pending" (`freegen` fills it on vLLM), or
-    "disabled" when free_gen is False.
+    "disabled" when free_gen is False. persona_judge: the same for the `persona` step (status "pending" or
+    "disabled").
 
     previous: this run's earlier eval.json (`eval` re-runs). Its free_gen block (top level and per trait) and
     free-gen timing are kept when free_gen is True, since free answers depend only on the vectors and the held
-    questions; the pass rule is recomputed with them.
+    questions; the pass rule is recomputed with them. The same for its persona_judge block (top level and per
+    trait) when persona_judge is True and the previous block is not "disabled".
     """
     model.requires_grad_(False)
     model.eval()
@@ -278,6 +302,7 @@ def evaluate(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], trained
                  "n_kl_held": len(kl_held),
                  "logprob_norm": cfg.logprob_norm,
                  "free_gen": {"enabled": bool(free_gen), "status": "pending" if free_gen else "disabled"},
+                 "persona_judge": {"status": "pending" if persona_judge else "disabled"},
                  "timing": {"teacher_forced_s": None, "free_gen_s": None},
                  "traits": {}}
     path = run_root(cfg.out, cfg.run_name) / "eval.json"
@@ -323,6 +348,14 @@ def evaluate(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], trained
             fg = previous.get("traits", {}).get(s, {}).get("free_gen")
             if fg is not None:
                 res["traits"][s]["free_gen"] = fg
+    pj_prev = (previous or {}).get("persona_judge")
+    if persona_judge and pj_prev and pj_prev.get("status") != "disabled":
+        res["persona_judge"] = pj_prev
+        res["timing"]["persona_s"] = previous.get("timing", {}).get("persona_s")
+        for s in slugs:
+            blk = previous.get("traits", {}).get(s, {}).get("persona_judge")
+            if blk is not None:
+                res["traits"][s]["persona_judge"] = blk
     apply_pass(res, slugs)
     res["timing"]["teacher_forced_s"] = round(time.monotonic() - t0, 2)
     write_json(path, res)

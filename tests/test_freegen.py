@@ -313,7 +313,8 @@ def test_pending_to_done_with_per_item_lists(run, monkeypatch, capsys):
     assert t["trained_random"]["c=-1"]["answer"] == [None] * 3 and t["trained_random"]["c=-1"]["accuracy"] == 0.0
     # pass rule recomputed with the free-gen checks
     p = ev["traits"]["assertive"]["pass"]
-    assert p["skipped"] == [] and p["checks"]["c=+1"]["accuracy"]["passed"] is True
+    assert p["skipped"] == ["judge@c=+1", "coherence@c=+1", "judge@c=-1", "coherence@c=-1"]
+    assert p["checks"]["c=+1"]["accuracy"]["passed"] is True
     assert p["checks"]["c=+1"]["length"]["passed"] is True  # |110-100| < |300..400-100|
     assert p["passed"] is True and ev["summary"] == {"assertive": True, "calm": True}
     assert ev["traits"]["assertive"]["kinds"] == _kinds() and ev["timing"]["teacher_forced_s"] == 1.0

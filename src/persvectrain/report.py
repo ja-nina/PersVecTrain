@@ -5,8 +5,9 @@ _MARGIN_CS = ("c=+1", "c=-1")
 
 
 def is_pending(ev: dict) -> bool:
-    """Free generation not run yet (`freegen` still to do): the run's pass flags are not final."""
-    return (ev.get("free_gen") or {}).get("status") == "pending"
+    """Free generation or the persona judge not run yet (`freegen` / `persona` still to do): the run's pass flags
+    are not final. An eval.json without a persona_judge key (an old run) is not pending for it."""
+    return (ev.get("free_gen") or {}).get("status") == "pending"         or (ev.get("persona_judge") or {}).get("status") == "pending"
 
 
 def n_passed(ev: dict) -> int:

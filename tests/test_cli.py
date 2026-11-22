@@ -133,6 +133,7 @@ def test_cli_train_end_to_end_tiny(tiny, out_root, capsys):
     assert len(t["kinds"]["trained"]["c=+1"]["margins"]) == 4 and len(t["kinds"]["trained"]["c=+1"]["kls"]) == 5
     # no HF free generation in train: pending until `freegen` (vLLM)
     assert e["free_gen"] == {"enabled": True, "status": "pending"} and "free_gen" not in t
+    assert e["persona_judge"] == {"status": "pending"} and "persona_judge" not in t
     assert not [c for c in tiny if c.startswith("generate")]
     assert "accuracy@c=+1" in t["pass"]["skipped"]
     assert e["summary"] == {"assertive": t["pass"]["passed"]}
@@ -142,12 +143,20 @@ def test_cli_train_end_to_end_tiny(tiny, out_root, capsys):
     assert "reference meta" in out and "missing" in out
 
 
+def test_cli_train_no_judge(tiny, out_root):
+    _fake_reference(out_root)
+    assert cli.main(_train_args(out_root, "--no-judge")) == 0
+    e = json.loads((out_root / "trained" / "run1" / "eval.json").read_text(encoding="utf-8"))
+    assert e["persona_judge"] == {"status": "disabled"} and e["free_gen"]["status"] == "pending"
+    assert "judge@c=+1" in e["traits"]["assertive"]["pass"]["skipped"]
+
+
 def test_cli_train_no_free_gen_and_tokens(tiny, out_root):
     _fake_reference(out_root)
     assert cli.main(_train_args(out_root, "--no-free-gen")) == 0
     e = json.loads((out_root / "trained" / "run1" / "eval.json").read_text(encoding="utf-8"))
     assert e["free_gen"]["enabled"] is False and not [c for c in tiny if c.startswith("generate")]
-    assert e["free_gen"]["status"] == "disabled"
+    assert e["free_gen"]["status"] == "disabled" and e["persona_judge"] == {"status": "pending"}  # independent flags
     assert "length@c=+1" in e["traits"]["assertive"]["pass"]["skipped"]
 
     args = _train_args(out_root, "--free-gen-tokens", "32")  # gone: freegen has --max-tokens
@@ -196,7 +205,7 @@ def test_cli_eval_reruns_on_existing_run(tiny, out_root, monkeypatch):
     assert [p.index for p in td.train] == tj["splits"]["assertive"]["train"]
     assert [r.id for r in seen["kl_held"]] == tj["splits"]["reference"]["held"]
     assert seen["cfg"].layer == 1 and seen["cfg"].traits == ["assertive"]
-    assert seen["kw"] == {"free_gen": False, "previous": None}
+    assert seen["kw"] == {"free_gen": False, "previous": None, "persona_judge": True}
 
 
 def test_cli_train_freegen_then_eval_keeps_free_gen(tiny, out_root, tmp_path, monkeypatch, capsys):
@@ -227,13 +236,15 @@ def test_cli_train_freegen_then_eval_keeps_free_gen(tiny, out_root, tmp_path, mo
     e = json.loads((root / "eval.json").read_text(encoding="utf-8"))
     t = e["traits"]["assertive"]
     assert e["free_gen"]["status"] == "done" and t["free_gen"]["trained"]["c=-1"]["accuracy"] == 1.0
-    assert t["pass"]["skipped"] == [] and "accuracy" in t["pass"]["checks"]["c=-1"]
+    assert t["pass"]["skipped"] == ["judge@c=+1", "coherence@c=+1", "judge@c=-1", "coherence@c=-1"]
+    assert "accuracy" in t["pass"]["checks"]["c=-1"]
 
     # `eval` re-runs the teacher-forced part and keeps the free-gen block
     assert cli.main(["eval", "--out", str(out_root), "--run-name", "run1"]) == 0
     again = json.loads((root / "eval.json").read_text(encoding="utf-8"))
     assert again["free_gen"] == e["free_gen"] and again["traits"]["assertive"]["free_gen"] == t["free_gen"]
-    assert again["traits"]["assertive"]["pass"]["skipped"] == []
+    assert again["traits"]["assertive"]["pass"]["skipped"] == ["judge@c=+1", "coherence@c=+1", "judge@c=-1",
+                                                               "coherence@c=-1"]
 
 
 def test_cli_eval_missing_run(tiny, out_root):

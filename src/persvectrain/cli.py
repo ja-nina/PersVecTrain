@@ -19,6 +19,8 @@ from persvectrain.data import full_source_vector, load_pairs, start_vector, supe
 from persvectrain.evaluate import evaluate
 from persvectrain.freegen import MAX_TOKENS as FREEGEN_MAX_TOKENS
 from persvectrain.freegen import POOL, run_freegen
+from persvectrain.persona import MAX_TOKENS as PERSONA_MAX_TOKENS
+from persvectrain.persona import run_persona
 from persvectrain.generate import generate as _generate
 from persvectrain.output import (PERSVECFAST_REPO, REPO, build_train_json, config_from_train_json, git_commit,
                                  load_reference, load_trained, prepare_run, run_dir, run_root, source_dir,
@@ -216,13 +218,16 @@ def cmd_train(args) -> int:
         write_vectors(vec_dir, slug, cfg.layer, vectors[slug], src, cfg.run_name)
     # evaluate the vectors as saved (cast to the source dtype), as `eval` on this run would
     evaluate(model, tok, cfg, traits, load_trained(vec_dir, kept, cfg.layer), ref_held,
-             free_gen=not args.no_free_gen)
+             free_gen=not args.no_free_gen, persona_judge=not args.no_judge)
     meta.update(finished=True, ended=_now())
     write_json(root / "train.json", meta)
     log(f"train {cfg.run_name}: wrote {root}")
     if not args.no_free_gen:
         log(f"train {cfg.run_name}: free generation pending: run `python -m persvectrain freegen --out {cfg.out} "
             f"--run-name {cfg.run_name}` (vLLM)")
+    if not args.no_judge:
+        log(f"train {cfg.run_name}: persona judge pending: run `python -m persvectrain persona --out {cfg.out} "
+            f"--run-name {cfg.run_name}` (vLLM + OpenRouter key)")
     return 0
 
 
@@ -255,8 +260,9 @@ def cmd_eval(args) -> int:
 
     model, tok = load_model(cfg.model)
     log(f"eval {cfg.run_name}: traits {cfg.traits}, layer {cfg.layer}")
-    previous = read_json(root / "eval.json") if (root / "eval.json").exists() and not args.no_free_gen else None
-    evaluate(model, tok, cfg, traits, trained, ref_held, free_gen=not args.no_free_gen, previous=previous)
+    previous = read_json(root / "eval.json") if (root / "eval.json").exists() else None
+    evaluate(model, tok, cfg, traits, trained, ref_held, free_gen=not args.no_free_gen, previous=previous,
+             persona_judge=not args.no_judge)
     return 0
 
 
@@ -264,6 +270,18 @@ def _add_eval_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-free-gen", action="store_true",
                    help="no free generation for this run (free_gen status disabled: `freegen` skips it and the "
                         "pass rule skips its length and accuracy checks)")
+    p.add_argument("--no-judge", action="store_true", dest="no_judge",
+                   help="no persona judge for this run (persona_judge status disabled: `persona` skips it and the "
+                        "pass rule skips its judge and coherence checks)")
+
+
+# ---------------------------------------------------------------- persona
+
+
+def cmd_persona(args) -> int:
+    res = run_persona(Path(args.out), args.run_name, max_tokens=args.max_tokens, fresh=args.fresh,
+                      judge_concurrency=args.judge_concurrency)
+    return 0 if res is not None else 1
 
 
 # ---------------------------------------------------------------- freegen
@@ -380,6 +398,17 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--rescore-only", action="store_true", dest="rescore_only",
                    help="no engine: re-parse the saved answers and rewrite eval.json's free-gen parts")
     p.set_defaults(func=cmd_freegen)
+
+    p = sub.add_parser("persona", help="persona answers of a finished run on vLLM, scored by an OpenRouter judge "
+                                       "(key from OPENROUTER_API_KEY or PersVecFast's .env); fills eval.json's "
+                                       "persona_judge block and recomputes the pass rule")
+    p.add_argument("--out", required=True, help="out root holding trained/<run_name>")
+    p.add_argument("--run-name", required=True, dest="run_name")
+    p.add_argument("--max-tokens", type=int, default=PERSONA_MAX_TOKENS, help="max new tokens per answer")
+    p.add_argument("--judge-concurrency", type=int, default=32, dest="judge_concurrency")
+    p.add_argument("--fresh", action="store_true",
+                   help="delete the run's persona_answers / persona_judged files first (default: resume)")
+    p.set_defaults(func=cmd_persona)
 
     p = sub.add_parser("kldepth", help="diagnostic: KL by answer position (0-512, 512-2048, ...) on the run's "
                                        "saved unsteered free answers; writes kl_depth.json only")
