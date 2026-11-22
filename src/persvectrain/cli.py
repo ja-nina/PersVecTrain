@@ -293,6 +293,17 @@ def cmd_freegen(args) -> int:
     return 0 if res is not None else 1
 
 
+# ---------------------------------------------------------------- bench
+
+
+def cmd_bench(args) -> int:
+    from persvectrain.bench import run_bench
+
+    res = run_bench(Path(args.out), args.run_name, questions=Path(args.questions), n=args.n,
+                    max_tokens=args.max_tokens, fresh=args.fresh)
+    return 0 if res is not None else 1
+
+
 # ---------------------------------------------------------------- kldepth
 
 
@@ -330,6 +341,11 @@ def cmd_report(args) -> int:
                 pass
     if evals:
         print(format_table(evals))
+    from persvectrain.bench import OUT_FILE as BENCH_FILE, format_bench
+    for run in evals:
+        bpath = run_root(Path(args.out), run) / BENCH_FILE
+        if bpath.exists():
+            print(format_bench(read_json(bpath)))
     best = pick_run(evals)
     print(f"picked: {best}" if best else "no run passes")
     if args.per_trait or args.write_profile:
@@ -406,6 +422,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-name", required=True, dest="run_name")
     _add_eval_flags(p)
     p.set_defaults(func=cmd_eval)
+
+    from persvectrain.bench import BENCH
+    p = sub.add_parser("bench", help="larger SuperGPQA accuracy check of a finished run on 500 new questions "
+                                     "(writes bench.json; not part of the pass rule)")
+    p.add_argument("--out", required=True, help="out root holding trained/<run_name>")
+    p.add_argument("--run-name", required=True, dest="run_name")
+    p.add_argument("--questions", default=str(BENCH), help="bench question file (scripts/make_bench.py)")
+    p.add_argument("--n", type=int, default=None, help="only the first n questions (default all)")
+    p.add_argument("--max-tokens", type=int, default=None, help=f"max new tokens (default {FREEGEN_MAX_TOKENS})")
+    p.add_argument("--fresh", action="store_true", help="delete the run's bench_answers.jsonl.gz first")
+    p.set_defaults(func=cmd_bench)
 
     p = sub.add_parser("freegen", help="free-generation check of a finished run on vLLM (fills eval.json's "
                                        "free_gen block and recomputes the pass rule)")

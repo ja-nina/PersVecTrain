@@ -33,6 +33,13 @@ PersVecFast (extracted responses and activations) and imports its `persvecfast` 
   the judge / coherence checks to the pass rule; resumes (`persona_answers.jsonl.gz`, `persona_judged.jsonl.gz`),
   a judge outage keeps the answers and the rerun judges only what is missing. `train --no-judge` (also `eval`) turns
   it off for a run (status disabled)
+- `bench --out O --run-name R [--n N] [--max-tokens] [--fresh]` (`sbatch slurm/bench.sbatch --out O --run-name R`)
+  - larger SuperGPQA accuracy check of a finished run on `data/supergpqa_bench500.jsonl`: 500 'hard' questions no
+  game / careful-reasoning / KL-pool question overlaps (`scripts/make_bench.py`: the next 500 of the same seed-0
+  shuffle as MA_Environments' supergpqa.jsonl). Answered like `freegen` (unsteered; trained / source_full / 5 random
+  at c = +-1, paired seeds), resumable (`bench_answers.jsonl.gz`); writes `trained/<run>/bench.json` with the paired
+  accuracy differences (trained - unsteered, source - unsteered, trained - source, random - unsteered). Not part of
+  the pass rule; `report` prints its table for every listed run that has one
 - `kldepth --out O --run-name R` - diagnostic, after `freegen`: KL(unsteered || steered) by answer position
   (tokens 0-512, 512-2048, 2048-4096, 4096-8192) on the run's saved unsteered free answers, teacher-forced, per
   trait x trained / source_full / trained_random x c = +-1, plus the paired source_full - trained per bucket.
