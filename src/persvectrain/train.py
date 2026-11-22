@@ -45,6 +45,7 @@ class TrainConfig:
     seed: int = 0
     logprob_norm: str = "sum"  # "sum" (BiPO) | "mean": each answer's summed log-prob / its answer tokens
     min_pairs: int = 20  # traits with fewer kept pairs are dropped (as `check`)
+    fix_norm: int = 0  # 1: after every optimizer step |v| is set back to |start| (direction-only training)
 
 
 @dataclass
@@ -69,6 +70,8 @@ def train(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], kl_train: 
     """Train one vector per trait in cfg.traits; returns {slug: fp32 cpu vector}. The model stays frozen."""
     if cfg.init not in ("dom", "zero"):
         raise ValueError(f"unknown init {cfg.init!r}")
+    if cfg.fix_norm and cfg.init != "dom":
+        raise ValueError("fix_norm needs init dom (the start vector's length)")
     if cfg.mode not in ("solo", "joint"):
         raise ValueError(f"unknown mode {cfg.mode!r}")
     if cfg.logprob_norm not in LOGPROB_NORMS:
@@ -121,6 +124,13 @@ def _cos_start(v: Tensor, start: Tensor | None) -> float | None:
 
 def _start_of(cfg: TrainConfig, td: TraitData) -> Tensor | None:
     return td.start.detach().float() if cfg.init == "dom" else None
+
+
+@torch.no_grad()
+def _fix_norm(cfg: TrainConfig, v: Tensor, start: Tensor | None) -> None:
+    """--fix-norm 1: rescale v in place to the start vector's length (only the direction is trained)."""
+    if cfg.fix_norm:
+        v.mul_(start.norm().to(v.device) / v.norm().clamp_min(1e-12))
 
 
 @torch.no_grad()
@@ -264,6 +274,7 @@ def _train_solo(model, tok, cfg, traits, kl_train, log_step) -> dict[str, Tensor
                 loss_p, margin, loss_kl, kl_cursor = _single_terms(model, cfg, v, sign, idx, enc, lp0, kl_enc,
                                                                    kl_cursor)
                 opt.step()
+                _fix_norm(cfg, v, start)
                 sched.step()
                 log_step(_single_log(step, slug, sign, loss_p, margin, loss_kl, 0.0, norm, cos, lr))
                 step += 1
@@ -353,6 +364,8 @@ def _train_joint(model, tok, cfg, traits, kl_train, log_step) -> dict[str, Tenso
             loss_o = _overlap_term(cfg, all_vs)
             entry = _single_log(step, slug, sign, loss_p, margin, loss_kl, loss_o, norm, cos, lr)
         opt.step()
+        for s in slugs:
+            _fix_norm(cfg, vs[s], starts[s])
         sched.step()
         log_step(entry)
     return {s: vs[s].detach().float().cpu().clone() for s in slugs}

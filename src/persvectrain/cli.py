@@ -384,7 +384,7 @@ def cmd_report(args) -> int:
 # ---------------------------------------------------------------- parser
 
 _REQUIRED_TYPES = {"model": str, "layer": int, "mode": str, "source": str, "out": str, "run_name": str}
-_CHOICES = {"mode": ("solo", "joint"), "init": ("dom", "zero"), "logprob_norm": LOGPROB_NORMS}
+_CHOICES = {"mode": ("solo", "joint"), "init": ("dom", "zero"), "logprob_norm": LOGPROB_NORMS, "fix_norm": (0, 1)}
 
 
 def _add_train_flags(p: argparse.ArgumentParser) -> None:

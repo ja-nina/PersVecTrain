@@ -459,3 +459,21 @@ def test_kl_tokens_truncates_kl_answers_not_persona_pairs():
 def char_tok_for_test():
     from tests.conftest import CharTokenizer
     return CharTokenizer()
+
+
+@pytest.mark.parametrize("mode", ["solo", "joint"])
+def test_fix_norm_keeps_the_start_length_and_changes_the_direction(tiny_model, char_tok, mode):
+    tds = {"t1": _trait("t1"), "t2": _trait("t2")}
+    cfg = _cfg(mode=mode, traits=["t1", "t2"], lambda_kl=1.0, fix_norm=1)
+    vecs = train(tiny_model, char_tok, cfg, tds, _refs(), lambda d: None)
+    free = train(tiny_model, char_tok, _cfg(mode=mode, traits=["t1", "t2"], lambda_kl=1.0), tds, _refs(),
+                 lambda d: None)
+    for s, td in tds.items():
+        assert float(vecs[s].norm()) == pytest.approx(float(td.start.norm()), rel=1e-5)
+        assert not torch.allclose(vecs[s] / vecs[s].norm(), td.start / td.start.norm(), atol=1e-4)
+        assert abs(float(free[s].norm()) - float(td.start.norm())) > 1e-4  # without it the length moves
+
+
+def test_fix_norm_needs_dom_init(tiny_model, char_tok):
+    with pytest.raises(ValueError, match="fix_norm"):
+        train(tiny_model, char_tok, _cfg(init="zero", fix_norm=1), {"t1": _trait("t1")}, _refs(), lambda d: None)
