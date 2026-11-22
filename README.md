@@ -39,7 +39,12 @@ PersVecFast (extracted responses and activations) and imports its `persvecfast` 
   shuffle as MA_Environments' supergpqa.jsonl). Answered like `freegen` (unsteered; trained / source_full / 5 random
   at c = +-1, paired seeds), resumable (`bench_answers.jsonl.gz`); writes `trained/<run>/bench.json` with the paired
   accuracy differences (trained - unsteered, source - unsteered, trained - source, random - unsteered). Not part of
-  the pass rule; `report` prints its table for every listed run that has one
+  the pass rule; `report` prints its table for every listed run that has one. bench and `persona` also answer with
+  `source_at_trained_norm` (the source direction scaled to the trained vector's length): the length control, so
+  trained - srcN is the effect of the direction alone
+- `bash slurm/followup.sh [RUN=JOBID ...]` - after the grid: per run, [after its running job] `persona` (or a full
+  re-evaluation for `REEVAL_RUNS`, default solo_kl0) then `bench`, plus one `vecs --model` job; `sbatch
+  slurm/pvt.sbatch <subcommand ...>` runs any one command on a GPU node
 - `vecs --out O --runs R1 R2 ... [--model] [--n 40]` - analysis, reads only: per trait the change training made
   (trained - start vector; the start is the train-pairs mean difference training begins from), split into
   rescaling along the start and rotation orthogonal to it, against the split noise (source_full - start, a null:

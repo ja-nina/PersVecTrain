@@ -4,7 +4,8 @@ The 100 held-out pool questions give an accuracy SE of about 0.04, as large as t
 answers `data/supergpqa_bench500.jsonl` (scripts/make_bench.py: the next 500 'hard' questions of the same seed-0
 shuffle as MA_Environments' supergpqa.jsonl, so none of the games' / careful-reasoning / KL-pool questions) exactly
 like `freegen`: vLLM-Hook steer engine, once unsteered, and per trait `trained`, `source_full` and `trained_random`
-(5 random directions, question i uses k = i % 5) at c = +1 and -1, neutral system prompt, thinking off as freegen,
+(5 random directions, question i uses k = i % 5) and source_at_trained_norm (the source direction at the
+trained vector's length: the length control) at c = +1 and -1, neutral system prompt, thinking off as freegen,
 the games' max_tokens and the model card's sampling; one seed per (c, question) for every steered kind (paired).
 
 Answers go to run_root/bench_answers.jsonl.gz (resumable, as freegen's file); results to run_root/bench.json with
@@ -23,7 +24,7 @@ from persvecfast.util import chunks, log, read_json, write_json
 
 from persvectrain import freegen as fg
 from persvectrain.data import supergpqa_prompts
-from persvectrain.evaluate import FREE_GEN_C, RANDOM_DIRS, c_key, mean_se
+from persvectrain.evaluate import FREE_GEN_C, FREE_GEN_KINDS, RANDOM_DIRS, c_key, mean_se
 from persvectrain.output import REPO, config_from_train_json, run_root
 from persvectrain.train import RefAnswer
 
@@ -32,7 +33,11 @@ ANSWERS_FILE = "bench_answers.jsonl.gz"
 OUT_FILE = "bench.json"
 # (name, a, b): paired accuracy difference a - b per (trait, c)
 DIFFS = (("trained-unsteered", "trained", "unsteered"), ("source-unsteered", "source_full", "unsteered"),
-         ("trained-source", "trained", "source_full"), ("random-unsteered", "trained_random", "unsteered"))
+         ("trained-source", "trained", "source_full"), ("random-unsteered", "trained_random", "unsteered"),
+         ("normsrc-unsteered", fg.NORM_MATCHED, "unsteered"), ("trained-normsrc", "trained", fg.NORM_MATCHED))
+# source_at_trained_norm (the source direction at the trained vector's length) separates "shorter vector" from
+# "other direction": trained - normsrc is the effect of the direction alone
+KINDS = (*FREE_GEN_KINDS, fg.NORM_MATCHED)
 
 
 def bench_questions(path: Path, n: int | None = None) -> tuple[list[RefAnswer], dict[str, int]]:
@@ -52,8 +57,7 @@ def diffs(unsteered: dict, trait_fg: dict) -> dict:
     out = {}
     for c in FREE_GEN_C:
         k = c_key(c)
-        blk = {"unsteered": unsteered, **{kind: trait_fg[kind][k] for kind in ("trained", "source_full",
-                                                                            "trained_random")}}
+        blk = {"unsteered": unsteered, **{kind: trait_fg[kind][k] for kind in KINDS}}
         if any(b["qid"] != unsteered["qid"] for b in blk.values()):
             raise ValueError(f"bench answers at {k} are not paired: question ids differ between kinds")
         out[k] = {}
@@ -94,7 +98,7 @@ def run_bench(out: Path, run_name: str, questions: Path = BENCH, n: int | None =
         answers_path.unlink()
 
     spec = MODELS[cfg.model]
-    plan = fg.request_plan(cfg, held, slugs)
+    plan = fg.request_plan(cfg, held, slugs, KINDS)
     lines, damaged = fg.read_answers(answers_path)
     if damaged:
         log(f"bench: {answers_path} was damaged (cut or partial line); kept {len(lines)} complete answers")
@@ -105,8 +109,10 @@ def run_bench(out: Path, run_name: str, questions: Path = BENCH, n: int | None =
     paths = fg.freegen_vector_paths(cfg, slugs)
     if not all(p.exists() for kv in paths.values() for v in kv.values() for p in (v if isinstance(v, list) else [v])):
         paths = fg.write_freegen_vectors(cfg, slugs)  # the same files freegen writes (deterministic)
+    fg.write_norm_matched(cfg, slugs, paths)
     tok = fg.load_tokenizer(cfg.model)
-    reqs = [r for r in fg.build_requests(cfg, held, n_options, paths, tok, max_tokens) if r.key not in done]
+    reqs = [r for r in fg.build_requests(cfg, held, n_options, paths, tok, max_tokens, KINDS)
+            if r.key not in done]
     log(f"bench {run_name}: {len(plan)} requests ({len(held)} questions, traits {slugs}), {max_tokens} new tokens, "
         f"{len(plan) - len(reqs)} saved in {answers_path.name}, {len(reqs)} to generate in chunks of "
         f"{spec.batch_size}")
@@ -125,7 +131,7 @@ def run_bench(out: Path, run_name: str, questions: Path = BENCH, n: int | None =
     missing = [key for key, _ in plan if key not in done]
     if missing:
         raise RuntimeError(f"bench: the engine returned no answer for {len(missing)} requests, e.g. {missing[0]}")
-    unsteered, per_trait = fg.fold(done, held, n_options, slugs)
+    unsteered, per_trait = fg.fold(done, held, n_options, slugs, KINDS)
     res = {"run_name": run_name, "questions": str(Path(questions).resolve()), "n": len(held),
            "engine": "vllm-hook (persvecfast.mia steer)", "max_tokens": max_tokens,
            "sampling": {k: v for k, v in asdict(spec).items() if k in fg.SAMPLING_FIELDS},
@@ -147,14 +153,18 @@ def format_bench(res: dict) -> str:
     """Accuracy per trait x c (unsteered, trained, source, random) and the paired differences with their SE."""
     u = res["unsteered"]["accuracy"]
     lines = [f"bench {res['run_name']}: {res['n']} SuperGPQA questions, unsteered accuracy {u:.3f}",
-             f"{'trait':<15} {'c':>3} {'trained':>8} {'source':>7} {'random':>7}   {'trained-unst':>14} "
-             f"{'source-unst':>14} {'trained-source':>14} {'random-unst':>14}"]
+             f"{'trait':<15} {'c':>3} {'trained':>8} {'source':>7} {'srcN':>6} {'random':>7}   "
+             f"{'trained-unst':>14} {'source-unst':>14} {'trained-source':>14} {'trained-srcN':>14} "
+             f"{'random-unst':>14}"]
     for s, t in res["traits"].items():
         for c in FREE_GEN_C:
             k = c_key(c)
             d = t["diffs"][k]
-            lines.append(f"{s:<15} {k[2:]:>3} {t['trained'][k]['accuracy']:>8.3f} {t['source_full'][k]['accuracy']:>7.3f} "
-                         f"{t['trained_random'][k]['accuracy']:>7.3f}   {_pm(d['trained-unsteered']):>14} "
-                         f"{_pm(d['source-unsteered']):>14} {_pm(d['trained-source']):>14} "
-                         f"{_pm(d['random-unsteered']):>14}")
+            nm = (t.get(fg.NORM_MATCHED) or {}).get(k, {}).get("accuracy")
+            nms = "-" if nm is None else f"{nm:.3f}"
+            tn = d.get("trained-normsrc") or {"mean": None}
+            lines.append(f"{s:<15} {k[2:]:>3} {t['trained'][k]['accuracy']:>8.3f} "
+                         f"{t['source_full'][k]['accuracy']:>7.3f} {nms:>6} {t['trained_random'][k]['accuracy']:>7.3f}   "
+                         f"{_pm(d['trained-unsteered']):>14} {_pm(d['source-unsteered']):>14} "
+                         f"{_pm(d['trained-source']):>14} {_pm(tn):>14} {_pm(d['random-unsteered']):>14}")
     return "\n".join(lines)

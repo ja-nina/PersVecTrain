@@ -64,9 +64,13 @@ def trait_info(slug: str) -> dict:
     return load_traits(TRAIT_DIR, names)[0]
 
 
+# the steered kinds: freegen's three plus the length control (source direction at the trained vector's length)
+KINDS = (*FREE_GEN_KINDS, fg.NORM_MATCHED)
+
+
 def conditions() -> list[tuple[str, float]]:
     """(kind, c) per trait in plan order."""
-    return [(UNSTEERED, 0.0), (ELICITED, 0.0)] + [(k, c) for k in FREE_GEN_KINDS for c in FREE_GEN_C]
+    return [(UNSTEERED, 0.0), (ELICITED, 0.0)] + [(k, c) for k in KINDS for c in FREE_GEN_C]
 
 
 def request_plan(cfg: TrainConfig, qs: list[tuple[str, str]], slugs: list[str]) -> list[tuple[tuple, int]]:
@@ -220,7 +224,7 @@ def fold(plan, answers, judged, slugs: list[str], qs) -> dict[str, dict]:
         return block([(slug, kind, c, qid) for qid, _ in qs], answers, judged)
 
     return {s: {UNSTEERED: blk(s, UNSTEERED, 0.0), ELICITED: blk(s, ELICITED, 0.0),
-                **{kind: {c_key(c): blk(s, kind, c) for c in FREE_GEN_C} for kind in FREE_GEN_KINDS}}
+                **{kind: {c_key(c): blk(s, kind, c) for c in FREE_GEN_C} for kind in KINDS}}
             for s in slugs}
 
 
@@ -280,7 +284,7 @@ def run_persona(out: Path, run_name: str, max_tokens: int = MAX_TOKENS, open_eng
     t0 = time.monotonic()
     spec = MODELS[cfg.model]
     tok = fg.load_tokenizer(cfg.model)
-    paths = fg.write_freegen_vectors(cfg, slugs)
+    paths = fg.write_norm_matched(cfg, slugs, fg.write_freegen_vectors(cfg, slugs))
     reqs = [r for r in build_requests(cfg, qs, paths, tok, max_tokens, traits) if r.key not in done]
     log(f"persona {run_name}: {len(plan)} requests ({len(qs)} questions, traits {slugs}), {max_tokens} new tokens, "
         f"{len(plan) - len(reqs)} saved, {len(reqs)} to generate")

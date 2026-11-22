@@ -96,7 +96,7 @@ def test_requests_count_seeds_prompts_and_rotation(prun, monkeypatch):
     engine, opened, world, oe, judges = _setup(monkeypatch)
     _persona(prun, oe, judges, max_tokens=64)
     reqs = _reqs(engine)
-    assert opened == ["steer"] and len(reqs) == N_Q * 2 * (2 + 3 * 2)
+    assert opened == ["steer"] and len(reqs) == N_Q * 2 * (2 + 4 * 2)
     assert all(r.max_tokens == 64 for r in reqs)
     by = {r.key: r for r in reqs}
     assert len(by) == len(reqs)
@@ -173,7 +173,7 @@ def test_judge_error_keeps_answers_and_rerun_judges_only_the_rest(prun, monkeypa
     with pytest.raises(SystemExit, match="402 no credit") as e:
         _persona(prun, oe, judges, judge_concurrency=1)
     assert "rerun" in str(e.value)
-    n_req = N_Q * 2 * 8
+    n_req = N_Q * 2 * 10
     assert len(pm.fg.read_answers(prun["root"] / pm.ANSWERS_FILE)[0]) == n_req  # all answers kept
     judged = pm.read_judged(prun["root"] / pm.JUDGED_FILE)
     assert 0 < len(judged) < n_req

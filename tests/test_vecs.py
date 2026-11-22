@@ -81,3 +81,8 @@ def test_cli_vecs_without_and_with_model(two_runs, monkeypatch, capsys):
     assert "logit lens u1 up" in text and "residual geometry" in text
     r = json.loads((out / "trained" / "analysis" / "vecs_run1.json").read_text(encoding="utf-8"))["runs"]["run1"]
     assert len(r["logit_lens"]["u1"]["up"]) == 15 and "assertive:delta" in r["geometry"]
+    assert cli.main(["vecs", "--out", str(out), "--runs", "run1", "run2", "--model", "--n", "3"]) == 0
+    text = capsys.readouterr().out
+    assert "logit lens mean_change up" in text and "geometry u1_change" in text
+    x = json.loads((out / "trained" / "analysis" / "vecs_run1_run2.json").read_text(encoding="utf-8"))
+    assert set(x["across_runs"]["run1 vs run2"]["logit_lens"]) == {"mean_change", "u1_change"}

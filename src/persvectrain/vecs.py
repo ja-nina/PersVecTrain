@@ -120,15 +120,15 @@ def analyse(runs: dict[str, dict[str, tuple]]) -> dict:
             diff = {s: (db[s] - da[s]) for s in common}
             s0 = {s: runs[a][s][0].float() for s in common}
             dsh = shared({s: perp(diff[s], s0[s]) for s in common}) if len(common) > 1 else None
-            if dsh:
-                dsh.pop("u1")
+            pair_u1 = dsh.pop("u1") if dsh else None
             res["across_runs"][f"{a} vs {b}"] = {
                 "delta_cos": {s: cos(da[s], db[s]) for s in common},
                 "u1_cos": cos(res["runs"][a]["_u1"], res["runs"][b]["_u1"]),
                 "b_minus_a": {"rel": {s: float(diff[s].norm() / s0[s].norm()) for s in common},
                               "along_start_rel": {s: float(diff[s] @ unit(s0[s])) / float(s0[s].norm())
                                                   for s in common},
-                              "shared_perp": dsh}}
+                              "shared_perp": dsh},
+                "_u1": pair_u1, "_mean": torch.stack([diff[s] for s in common]).mean(0)}
     return res
 
 
@@ -209,8 +209,15 @@ def run_vecs(out: Path, runs: list[str], model=None, tok=None, n_items: int = 40
             for s, (s0, t, _) in vecs.items():
                 dirs[f"{s}:start"], dirs[f"{s}:trained"], dirs[f"{s}:delta"] = s0, t, deltas[s]
             r["geometry"] = geometry(H, dirs)
+        for pair, x in res["across_runs"].items():
+            # the change from the first run to the second (what the other KL weight adds)
+            dirs = {"mean_change": x["_mean"]} | ({"u1_change": x["_u1"]} if x["_u1"] is not None else {})
+            x["logit_lens"] = {nm: logit_lens(model, tok, d) for nm, d in dirs.items()}
+            x["geometry"] = geometry(H, dirs)
     for r in res["runs"].values():
         r.pop("_u1"), r.pop("_deltas")
+    for x in res["across_runs"].values():
+        x.pop("_u1"), x.pop("_mean")
     path = Path(out) / "trained" / "analysis" / f"vecs_{'_'.join(runs)}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, res)
@@ -255,6 +262,16 @@ def format_vecs(res: dict) -> str:
         bm = x["b_minus_a"]
         L.append("   second - first (rel. |s0|): " + ", ".join(
             f"{s} {bm['rel'][s]:.2f} (along {bm['along_start_rel'][s]:+.2f})" for s in bm["rel"]))
+        for nm, ll in (x.get("logit_lens") or {}).items():
+            L.append(f"   logit lens {nm} up:   {ll['up']}")
+            L.append(f"   logit lens {nm} down: {ll['down']}")
+        if "geometry" in x:
+            g = x["geometry"]
+            for nm, v in g.items():
+                if isinstance(v, dict) and "var_vs_random" in v:
+                    L.append(f"   geometry {nm}: " + " ".join(f"{k} {v[k]:.3f}" for k in g["random_pc_share"])
+                             + f" (random " + "/".join(f"{g['random_pc_share'][k]:.4f}" for k in g["random_pc_share"])
+                             + f"), var x{v['var_vs_random']:.2f}, cos(mean) {v['cos_mean_residual']:+.2f}")
         if bm["shared_perp"]:
             sp = bm["shared_perp"]
             L.append(f"   its orthogonal part across traits: mean cos {sp['mean_cos']:+.3f}, mean |cos| "

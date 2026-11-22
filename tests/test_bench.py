@@ -34,7 +34,7 @@ def test_bench_requests_results_and_diffs(run, monkeypatch, tmp_path):
     res = bm.run_bench(run["out"], "run1", questions=_bench_file(tmp_path), max_tokens=64)
     reqs = _reqs(engine)
     assert opened == [(run["cfg"].model, "steer")]
-    assert len(reqs) == len(BQ) * (1 + 3 * 2 * 2)  # unsteered + 2 traits x 3 kinds x 2 c
+    assert len(reqs) == len(BQ) * (1 + 4 * 2 * 2)  # unsteered + 2 traits x 4 kinds x 2 c
     by_key = {r.key: r for r in reqs}
     for q in BQ:
         assert by_key[("-", "unsteered", 0.0, q)].steer is None
@@ -102,3 +102,18 @@ def test_bench_file_in_repo_is_new_questions():
     bench = [json.loads(l)["id"] for l in bm.BENCH.read_text(encoding="utf-8").splitlines() if l.strip()]
     pool = {json.loads(l)["id"] for l in fgm.POOL.read_text(encoding="utf-8").splitlines() if l.strip()}
     assert len(bench) == len(set(bench)) == 500 and not set(bench) & pool
+
+
+def test_bench_length_control_vector(run, monkeypatch, tmp_path):
+    """source_at_trained_norm: the source direction at exactly the trained vector's length; its diffs are reported."""
+    import torch
+    _fake(monkeypatch, _reply)
+    res = bm.run_bench(run["out"], "run1", questions=_bench_file(tmp_path), max_tokens=64)
+    d = run["root"] / "freegen_vectors"
+    for slug in ("assertive", "calm"):
+        nm = torch.load(d / f"{slug}_{fgm.NORM_MATCHED}.pt")["dir"]
+        t, sf = torch.load(d / f"{slug}_trained.pt")["dir"], torch.load(d / f"{slug}_source_full.pt")["dir"]
+        assert float(nm.norm()) == pytest.approx(float(t.norm()), rel=1e-5)
+        assert float(torch.nn.functional.cosine_similarity(nm, sf, dim=0)) == pytest.approx(1.0, abs=1e-5)
+    assert res["traits"]["calm"]["diffs"]["c=-1"]["trained-normsrc"]["mean"] == pytest.approx(0.5)  # fake: srcN always wrong
+    assert "trained-srcN" in bm.format_bench(res)

@@ -17,7 +17,8 @@ def _bash(code: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run([BASH, "-c", code, "x", *args], capture_output=True, text=True, cwd=SLURM.parent)
 
 
-@pytest.mark.parametrize("name", ["run.sbatch", "train.sbatch", "sweep.sh", "lib.sh", "reeval.sbatch", "ablate.sh"])
+@pytest.mark.parametrize("name", ["run.sbatch", "train.sbatch", "sweep.sh", "lib.sh", "reeval.sbatch", "ablate.sh",
+                                  "bench.sbatch", "vecs.sbatch", "pvt.sbatch", "followup.sh"])
 def test_script_syntax(name):
     r = subprocess.run([BASH, "-n", str(SLURM / name)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
@@ -153,3 +154,43 @@ def test_ablate_refuses_while_pvt_jobs_queued_unless_forced(tmp_path):
     (tmp_path / "f").mkdir()
     r, calls, _ = _ablate(tmp_path / "f", {"SQUEUE": q.as_posix(), "FORCE": "1"})
     assert r.returncode == 0 and calls
+
+
+def _followup(tmp_path, states: dict[str, str], *args, runs="a b c d", reeval="a"):
+    out = tmp_path / "out"
+    for r in ("a", "b", "c"):
+        (out / "trained" / r).mkdir(parents=True, exist_ok=True)
+        (out / "trained" / r / "train.json").write_text('{"finished": true}', encoding="utf-8")
+    log = tmp_path / "calls.log"
+    sb = tmp_path / "sbatch.sh"
+    sb.write_bytes(f'#!/bin/bash\necho "$@" >> "{log.as_posix()}"\necho $((RANDOM + 100))\n'.encode())
+    sa = tmp_path / "sacct.sh"
+    case = "".join(f'  *{j}*) echo "  {s}";;\n' for j, s in states.items())
+    sa.write_bytes(f'#!/bin/bash\ncase "$*" in\n{case}  *) echo "";;\nesac\n'.encode())
+    env = {**os.environ, "SBATCH": sb.as_posix(), "SACCT": sa.as_posix(), "OUT": out.as_posix(), "RUNS": runs,
+           "REEVAL_RUNS": reeval, "VEC_RUNS": "a b"}
+    r = subprocess.run([BASH, str(SLURM / "followup.sh"), *args], capture_output=True, text=True, cwd=tmp_path,
+                       env=env)
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return r, calls
+
+
+def test_followup_chains_step1_bench_and_vecs(tmp_path):
+    # a: reeval (old eval.json); b: persona after running job 11; c: its job 12 already COMPLETED (no dependency);
+    # d: no train.json but its job 13 is running -> after 13
+    r, calls = _followup(tmp_path, {"11": "RUNNING", "12": "COMPLETED", "13": "PENDING"}, "b=11", "c=12", "d=13")
+    assert r.returncode == 0, r.stderr
+    assert len(calls) == 4 * 2 + 1
+    assert "reeval.sbatch --out" in calls[0] and "--run-name a" in calls[0] and "--dependency" not in calls[0]
+    assert calls[1].startswith("--parsable --dependency=afterok:") and "bench.sbatch" in calls[1]
+    assert "--dependency=afterok:11" in calls[2] and "pvt.sbatch persona" in calls[2] and "--run-name b" in calls[2]
+    assert "--dependency" not in calls[4] and "--run-name c" in calls[4]
+    assert "--dependency=afterok:13" in calls[6] and "--run-name d" in calls[6]
+    assert "--dependency" not in calls[8] and "vecs.sbatch" in calls[8] and calls[8].endswith("--runs a b")
+
+
+def test_followup_skips_a_failed_job_and_a_missing_run(tmp_path):
+    r, calls = _followup(tmp_path, {"21": "FAILED"}, "b=21", runs="b d", reeval="")
+    assert r.returncode == 0
+    assert "b: job 21 ended FAILED; skipped" in r.stderr and "d: no train.json" in r.stderr
+    assert len(calls) == 1 and "vecs.sbatch" in calls[0]  # only the vecs job
