@@ -20,13 +20,14 @@ from pathlib import Path
 
 import torch
 from persvecfast.engine import Request, Result
-from persvecfast.extract import RANDOM_CONTROL_SEED, random_control, vector_file
+from persvecfast.extract import vector_file
 from persvecfast.models import MODELS, request_seed
 from persvecfast.prompts import NEUTRAL_SYSTEM_PROMPT, chat_prompt
 from persvecfast.util import chunks, log, read_json, save_pt, write_json
 
 from persvectrain.data import LETTERS, full_source_vector, supergpqa_prompts
-from persvectrain.evaluate import (FREE_GEN_C, FREE_GEN_KINDS, apply_pass, c_key, fg_cols, mean_se, pass_lines)
+from persvectrain.evaluate import (FREE_GEN_C, FREE_GEN_KINDS, RANDOM_DIRS, apply_pass, c_key, fg_cols, mean_se,
+                                   pass_lines, random_set)
 from persvectrain.output import REPO, config_from_train_json, load_reference, run_dir, run_root, source_dir
 from persvectrain.train import RefAnswer, TrainConfig
 
@@ -106,43 +107,63 @@ def held_questions(meta: dict, pool: Path) -> tuple[list[RefAnswer], dict[str, i
     return held, {r.id: n_options[r.id] for r in held}
 
 
-def freegen_vector_paths(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[str, Path]]:
-    """{slug: {kind: run_root/freegen_vectors/{slug}_{kind}.pt}}, absolute; nothing written."""
+def random_name(slug: str, k: int) -> str:
+    """File name of the slug's k-th random direction (k = 0..4)."""
+    return f"{slug}_trained_random_k{k}.pt"
+
+
+def freegen_vector_paths(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[str, Path | list[Path]]]:
+    """{slug: {"trained": path, "source_full": path, "trained_random": [5 paths, k = 0..4]}} under
+    run_root/freegen_vectors, absolute; nothing written."""
     d = (run_root(cfg.out, cfg.run_name) / "freegen_vectors").resolve()
-    return {slug: {kind: d / f"{slug}_{kind}.pt" for kind in FREE_GEN_KINDS} for slug in slugs}
+    return {slug: {"trained": d / f"{slug}_trained.pt", "source_full": d / f"{slug}_source_full.pt",
+                   "trained_random": [d / random_name(slug, k) for k in range(RANDOM_DIRS)]} for slug in slugs}
 
 
-def freegen_vectors(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[str, torch.Tensor]]:
-    """{slug: {kind: vector}} for the three free-gen kinds; nothing written.
-
-    trained: the run's vllm_hook file as saved; source_full: the source's vector at the layer; trained_random:
-    random_control(trained, RANDOM_CONTROL_SEED + layer), as write_vectors and evaluate.vector_kinds.
-    """
+def _trained_and_source(cfg: TrainConfig, slugs: list[str]) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     vec_dir = run_dir(cfg.out, cfg.run_name, cfg.model)
     out = {}
     for slug in slugs:
         path = vector_file(vec_dir, slug, cfg.layer)
         if not path.exists():
             raise SystemExit(f"freegen: trained vector {path} missing")
-        trained = torch.load(path)["dir"]
-        out[slug] = {"trained": trained, "source_full": full_source_vector(source_dir(cfg), slug, cfg.layer),
-                     "trained_random": random_control(trained, RANDOM_CONTROL_SEED + cfg.layer)}
+        out[slug] = (torch.load(path)["dir"], full_source_vector(source_dir(cfg), slug, cfg.layer))
     return out
 
 
-def write_freegen_vectors(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[str, Path]]:
-    """run_root/freegen_vectors/{slug}_{kind}.pt = {"dir": vector} (freegen_vectors) for the three free-gen kinds;
-    absolute paths."""
+def freegen_vectors(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[str, torch.Tensor]]:
+    """{slug: {kind: vector}} for the three free-gen kinds; nothing written.
+
+    trained: the run's vllm_hook file as saved; source_full: the source's vector at the layer; trained_random: the
+    single twin random_control(trained, RANDOM_CONTROL_SEED + layer) = k = 0 of the random set (kldepth uses it;
+    write_freegen_vectors writes all 5 directions).
+    """
+    return {slug: {"trained": t, "source_full": sf, "trained_random": random_set(t, cfg.layer)[0]}
+            for slug, (t, sf) in _trained_and_source(cfg, slugs).items()}
+
+
+def write_freegen_vectors(cfg: TrainConfig, slugs: list[str]) -> dict[str, dict[str, Path | list[Path]]]:
+    """run_root/freegen_vectors/{slug}_trained.pt, _source_full.pt and _trained_random_k{0..4}.pt =
+    {"dir": vector}; absolute paths (freegen_vector_paths). No plain {slug}_trained_random.pt."""
     out = freegen_vector_paths(cfg, slugs)
-    for slug, vecs in freegen_vectors(cfg, slugs).items():
-        for kind in FREE_GEN_KINDS:
-            save_pt(out[slug][kind], {"dir": vecs[kind].detach().cpu().clone()})
+    for slug, (t, sf) in _trained_and_source(cfg, slugs).items():
+        save_pt(out[slug]["trained"], {"dir": t.detach().cpu().clone()})
+        save_pt(out[slug]["source_full"], {"dir": sf.detach().cpu().clone()})
+        for k, r in enumerate(random_set(t, cfg.layer)):
+            save_pt(out[slug]["trained_random"][k], {"dir": r.detach().cpu().clone()})
     return out
+
+
+def vector_for(paths: dict[str, dict], slug: str, kind: str, pos: int) -> Path:
+    """The vector file of a request for the question at held position pos: trained_random rotates, k = pos % 5."""
+    p = paths[slug][kind]
+    return p[pos % RANDOM_DIRS] if isinstance(p, list) else p
 
 
 def request_plan(cfg: TrainConfig, held: list[RefAnswer], slugs: list[str]) -> list[tuple[tuple, int]]:
     """(key, seed) of every free-gen request in order: unsteered once per held question, then per trait x kind x c;
-    keys (slug | "-", kind, c, question id).
+    keys (slug | "-", kind, c, question id). trained_random's direction is not in the key: held position i uses
+    random direction i % 5 (vector_for); saved answers carry the file name.
 
     Seeds: request_seed(cfg.seed, "freegen", c, qid) for every steered kind and trait (paired),
     request_seed(cfg.seed, "freegen", "unsteered", qid) unsteered.
@@ -156,15 +177,16 @@ def request_plan(cfg: TrainConfig, held: list[RefAnswer], slugs: list[str]) -> l
 
 
 def build_requests(cfg: TrainConfig, held: list[RefAnswer], n_options: dict[str, int],
-                   vector_paths: dict[str, dict[str, Path]], tok, max_tokens: int = MAX_TOKENS) -> list[Request]:
+                   vector_paths: dict[str, dict], tok, max_tokens: int = MAX_TOKENS) -> list[Request]:
     """The requests of request_plan (traits = vector_paths' keys) with their prompts and steering."""
     prompts = {r.id: chat_prompt(tok, NEUTRAL_SYSTEM_PROMPT, r.question + instruction(n_options[r.id]), False)
                for r in held}
+    pos = {r.id: i for i, r in enumerate(held)}
     reqs = []
     for key, seed in request_plan(cfg, held, list(vector_paths)):
         slug, kind, c, qid = key
         steer = None if kind == UNSTEERED else \
-            {"layer": cfg.layer, "coeff": c, "vector_path": str(vector_paths[slug][kind])}
+            {"layer": cfg.layer, "coeff": c, "vector_path": str(vector_for(vector_paths, slug, kind, pos[qid]))}
         reqs.append(Request(key, prompts[qid], seed, steer, max_tokens))
     return reqs
 
@@ -227,17 +249,33 @@ def write_answers(path: Path, lines: list[dict], append: bool = True) -> None:
 
 
 def answer_line(r: Result, req: Request) -> dict:
-    return {"key": list(req.key), "text": r.text, "n_tokens": int(r.n_tokens), "finish_reason": r.finish_reason,
+    line = {"key": list(req.key), "text": r.text, "n_tokens": int(r.n_tokens), "finish_reason": r.finish_reason,
             "max_tokens": req.max_tokens, "seed": req.seed}
+    if req.steer:
+        line["vector"] = Path(req.steer["vector_path"]).name  # which random direction trained_random used
+    return line
 
 
-def saved_results(lines: list[dict], plan: list[tuple[tuple, int]], max_tokens: int) -> dict[tuple, Result]:
-    """Results of the plan's requests found in the saved lines (same key, seed and max_tokens; the last line wins)."""
+def expected_vectors(plan: list[tuple[tuple, int]], held: list[RefAnswer]) -> dict[tuple, str]:
+    """The vector file name a saved trained_random answer must carry: the question's rotated direction."""
+    pos = {r.id: i for i, r in enumerate(held)}
+    return {key: random_name(key[0], pos[key[3]] % RANDOM_DIRS) for key, _ in plan if key[1] == "trained_random"}
+
+
+def saved_results(lines: list[dict], plan: list[tuple[tuple, int]], max_tokens: int,
+                  vectors: dict[tuple, str] | None = None) -> dict[tuple, Result]:
+    """Results of the plan's requests found in the saved lines (same key, seed and max_tokens; the last line wins).
+
+    vectors {key: file name} (expected_vectors): a line of such a key is reused only when its "vector" equals the
+    name, so an answer made with another random direction (or an old line without "vector") is regenerated.
+    """
     seeds = dict(plan)
+    vectors = vectors or {}
     out = {}
     for ln in lines:
         key = tuple(ln["key"])
-        if key in seeds and ln["seed"] == seeds[key] and ln["max_tokens"] == max_tokens:
+        if key in seeds and ln["seed"] == seeds[key] and ln["max_tokens"] == max_tokens \
+                and (key not in vectors or ln.get("vector") == vectors[key]):
             out[key] = Result(key, ln["text"], ln["n_tokens"], ln["finish_reason"])
     return out
 
@@ -261,7 +299,10 @@ def fold(results: dict[tuple, Result], held: list[RefAnswer], n_options: dict[st
          slugs: list[str]) -> tuple[dict, dict[str, dict]]:
     """(unsteered block, {slug: {"unsteered": ..., kind: {"c=+1": ..., "c=-1": ...}}})."""
     def block(slug: str, kind: str, c: float) -> dict:
-        return score([results[(slug, kind, c, q.id)] for q in held], held, n_options)
+        b = score([results[(slug, kind, c, q.id)] for q in held], held, n_options)
+        if kind == "trained_random":
+            b["direction"] = [i % RANDOM_DIRS for i in range(len(held))]  # random direction k of each item
+        return b
 
     unsteered = block("-", UNSTEERED, 0.0)
     per_trait = {s: {"unsteered": unsteered,
@@ -340,7 +381,8 @@ def run_freegen(out: Path, run_name: str, max_tokens: int | None = None, open_en
         # a job killed while writing: drop the damaged tail, so the members appended next are readable
         log(f"freegen: {answers_path} was damaged (cut or partial line); kept {len(lines)} complete answers")
         write_answers(answers_path, lines, append=False)
-    done = saved_results(lines, plan, max_tokens)
+    want = expected_vectors(plan, held)
+    done = saved_results(lines, plan, max_tokens, want)
     t0 = time.monotonic()
     if rescore_only:
         missing = [k for k, _ in plan if k not in done]
@@ -368,7 +410,7 @@ def run_freegen(out: Path, run_name: str, max_tokens: int | None = None, open_en
                     n += len(new)
                     log(f"freegen {run_name}: {len(plan) - len(reqs) + n}/{len(plan)} answers")
         lines, _ = read_answers(answers_path)
-        done = saved_results(lines, plan, max_tokens)
+        done = saved_results(lines, plan, max_tokens, want)
         missing = [k for k, _ in plan if k not in done]
         if missing:
             raise RuntimeError(f"freegen: the engine returned no answer for {len(missing)} requests, e.g. "
@@ -383,7 +425,9 @@ def run_freegen(out: Path, run_name: str, max_tokens: int | None = None, open_en
                       "presence_penalty_applied": True, "batch_size": spec.batch_size, "n_held": len(held),
                       "instruction": "End your reply with 'ANSWER: <letter>', one of A, B, ...",
                       "answers": str(answers_path.resolve()),
-                      "vectors": {s: {k: str(p) for k, p in kv.items()} for s, kv in paths.items()},
+                      "vectors": {s: {k: [str(x) for x in p] if isinstance(p, list) else str(p) for k, p in kv.items()}
+                            for s, kv in paths.items()},
+                      "random_dirs": RANDOM_DIRS,
                       "unsteered": unsteered}
     for s in slugs:
         ev["traits"][s]["free_gen"] = per_trait[s]

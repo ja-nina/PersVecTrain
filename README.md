@@ -21,7 +21,10 @@ PersVecFast (extracted responses and activations) and imports its `persvecfast` 
 - `eval` - re-run the evaluation of an existing run
 - `freegen --out O --run-name R` - free generation of a finished run on vLLM (unsteered, and per trait trained /
   source_full / trained_random at c = +-1): fills eval.json's `free_gen` block and recomputes the pass rule;
-  resumes from its saved answers, `--fresh`, `--rescore-only` (below)
+  resumes from its saved answers, `--fresh`, `--rescore-only` (below). `trained_random` is 5 norm-matched random
+  directions (files `freegen_vectors/{slug}_trained_random_k0..4.pt`; question i of the held list uses k = i % 5);
+  teacher-forced eval averages the same 5 at c = +-1. Answer lines record the vector file name, and saved
+  `trained_random` answers without it (old runs) are regenerated on the next `freegen`
 - `kldepth --out O --run-name R` - diagnostic, after `freegen`: KL(unsteered || steered) by answer position
   (tokens 0-512, 512-2048, 2048-4096, 4096-8192) on the run's saved unsteered free answers, teacher-forced, per
   trait x trained / source_full / trained_random x c = +-1, plus the paired source_full - trained per bucket.

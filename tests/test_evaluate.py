@@ -368,3 +368,63 @@ def test_evaluate_rerun_after_disabled_resets_to_pending(tiny_model, char_tok, t
     assert off["free_gen"]["status"] == "disabled"
     res = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": 2.0 * td.source}, _refs(2), previous=off)
     assert res["free_gen"] == {"enabled": True, "status": "pending"} and "free_gen" not in res["traits"]["t1"]
+
+
+# ---------------------------------------------------------------- 5 random directions
+
+
+def test_random_seeds_and_set():
+    assert ev.random_seeds(LAYER) == [RANDOM_CONTROL_SEED + LAYER + 1000 * k for k in range(5)]
+    v = 3.0 * torch.randn(16, generator=torch.Generator().manual_seed(1))
+    dirs = ev.random_set(v, LAYER)
+    assert len(dirs) == 5
+    for d in dirs:
+        assert float(d.norm()) == pytest.approx(float(v.norm()), rel=1e-5)
+    assert torch.equal(dirs[0], random_control(v, RANDOM_CONTROL_SEED + LAYER))  # k = 0 is today's twin
+    assert len({tuple(d.tolist()) for d in dirs}) == 5
+
+
+def test_random_kinds_are_the_mean_of_five_directions(tiny_model, char_tok, tmp_path):
+    cfg = _cfg(tmp_path)
+    td = _trait("t1", 1)
+    v = 1.5 * td.source + 0.1
+    refs = _refs(2)
+    res = ev.evaluate(tiny_model, char_tok, cfg, {"t1": td}, {"t1": v}, refs, free_gen=False)
+    assert res["random_dirs"] == 5
+    kinds = res["traits"]["t1"]["kinds"]
+    sources = {"trained_random": v, "source_random": td.source}
+    held = [(encode(char_tok, p.question, p.pos, MAX_TOK) + encode(char_tok, p.question, p.neg, MAX_TOK))
+            for p in td.held]
+    with torch.no_grad():
+        for kind, base in sources.items():
+            dirs = [d.float() for d in ev.random_set(base, LAYER)]
+            for c in (1.0, -1.0):
+                key = ev.c_key(c)
+                per_dir_kl = []
+                for d in dirs:
+                    kl = []
+                    for r in refs:
+                        ids, start = encode(char_tok, r.question, r.answer_text, MAX_TOK)
+                        lp0 = ev.answer_logprobs(tiny_model, ids, start)
+                        with steer(tiny_model, LAYER, c * d):
+                            lpc = ev.answer_logprobs(tiny_model, ids, start)
+                        kl.append(float(ev.kl_loss(lp0, lpc)))
+                    per_dir_kl.append(sum(kl) / len(kl))
+                row = kinds[kind][key]
+                assert row["per_direction"] == pytest.approx(per_dir_kl, rel=1e-4, abs=1e-7)
+                assert len(row["per_direction"]) == 5 and len(row["per_direction_margin"]) == 5
+                assert row["kl_mean"] == pytest.approx(sum(per_dir_kl) / 5, rel=1e-4, abs=1e-7)
+                assert sum(row["per_direction_margin"]) / 5 == pytest.approx(row["margin_mean"], rel=1e-4, abs=1e-6)
+                assert len(set(round(x, 9) for x in per_dir_kl)) > 1  # the directions differ
+            # c = +-0.5: k = 0 only, no per-direction block
+            for key in ("c=-0.5", "c=+0.5"):
+                assert "per_direction" not in kinds[kind][key]
+            # per pair margin at c = +1 by hand, mean of the 5 directions
+            ms = []
+            for d in dirs:
+                lp0 = ev._pair_logprobs(tiny_model, cfg, None, held[0])
+                ms.append(ev._margin(tiny_model, cfg, d, 1, held[0], lp0))
+            assert kinds[kind]["c=+1"]["margins"][0] == pytest.approx(sum(ms) / 5, rel=1e-4, abs=1e-6)
+    # the other kinds carry no per-direction block, and k = 0 stays the reported twin
+    assert "per_direction" not in kinds["trained"]["c=+1"]
+    assert res["traits"]["t1"]["norms"]["trained_random"] == pytest.approx(float(v.norm()))

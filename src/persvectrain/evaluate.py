@@ -27,6 +27,9 @@ KINDS = ("trained", "source_full", "source_train", "source_at_trained_norm", "tr
 FREE_GEN_KINDS = ("trained", "source_full", "trained_random")
 FREE_GEN_C = (1.0, -1.0)
 PASS_CS = ("c=+1", "c=-1")
+RANDOM_DIRS = 5  # random directions per twin; averaged at the pass-rule c values (+-1), k = 0 only elsewhere
+RANDOM_KINDS = ("trained_random", "source_random")
+RANDOM_SEED_STEP = 1000
 MIX_WEIGHTS = ((1, 1), (1, -1), (-1, 1), (-1, -1))
 
 
@@ -125,6 +128,28 @@ def pass_rule(trait_eval: dict) -> dict:
 # ---------------------------------------------------------------- teacher-forced pieces
 
 
+def random_seeds(layer: int) -> list[int]:
+    """Seeds of the random set: RANDOM_CONTROL_SEED + layer + 1000 k, k = 0..4 (k = 0 is the single twin of
+    PersVecFast / write_vectors)."""
+    return [RANDOM_CONTROL_SEED + layer + RANDOM_SEED_STEP * k for k in range(RANDOM_DIRS)]
+
+
+def random_set(v: Tensor, layer: int) -> list[Tensor]:
+    """The 5 random directions norm-matched to v (random_control), in k order."""
+    return [random_control(v, seed) for seed in random_seeds(layer)]
+
+
+def random_sets(cfg: TrainConfig, vecs: dict[str, Tensor]) -> dict[str, list[Tensor]]:
+    """{random kind: its 5 directions} for one trait's vector_kinds."""
+    return {"trained_random": [r.float() for r in random_set(vecs["trained"], cfg.layer)],
+            "source_random": [r.float() for r in random_set(vecs["source_full"], cfg.layer)]}
+
+
+def _dirs(kind: str, v: Tensor, c: float, rand: dict[str, list[Tensor]]) -> list[Tensor]:
+    """The vectors a (kind, c) cell is averaged over: the 5 random directions at c = +-1, else just v."""
+    return rand[kind] if kind in rand and abs(c) == 1.0 else [v]
+
+
 def vector_kinds(cfg: TrainConfig, td: TraitData, trained: Tensor) -> dict[str, Tensor]:
     v = trained.detach().float().cpu()
     src = td.source.detach().float().cpu()
@@ -133,9 +158,10 @@ def vector_kinds(cfg: TrainConfig, td: TraitData, trained: Tensor) -> dict[str, 
         "source_full": src,
         "source_train": td.start.detach().float().cpu(),
         "source_at_trained_norm": src * (v.norm() / src.norm()),
-        # twins at seed RANDOM_CONTROL_SEED + layer whatever cfg.seed is, as PersVecFast / MA_Environments
-        "trained_random": random_control(v, RANDOM_CONTROL_SEED + cfg.layer).float(),
-        "source_random": random_control(src, RANDOM_CONTROL_SEED + cfg.layer).float(),
+        # k = 0 of the random set: the twin at seed RANDOM_CONTROL_SEED + layer whatever cfg.seed is, as PersVecFast /
+        # MA_Environments (norms and cosines are reported for it; the others are in random_sets)
+        "trained_random": random_set(v, cfg.layer)[0].float(),
+        "source_random": random_set(src, cfg.layer)[0].float(),
     }
 
 
@@ -162,27 +188,48 @@ def _margin(model, cfg: TrainConfig, vec: Tensor, sign: int, enc: tuple, ref: tu
     return float(persona_margin(lpc[0], ref[0], lpc[1], ref[1], sign))
 
 
-def _margins(model, cfg: TrainConfig, held: list, vecs: dict[str, Tensor]) -> dict[str, dict[str, list[float]]]:
-    return {kind: {c_key(c): [_margin(model, cfg, c * v, 1 if c > 0 else -1, enc, lp0) for enc, lp0 in held]
-                   for c in C_VALUES}
-            for kind, v in vecs.items()}
+def _margins(model, cfg: TrainConfig, held: list, vecs: dict[str, Tensor], rand: dict[str, list[Tensor]]
+             ) -> tuple[dict[str, dict[str, list[float]]], dict[str, dict[str, list[float]]]]:
+    """(margins[kind][c] per held pair, per_direction[kind][c] = the mean margin of each random direction).
+    Random kinds at c = +-1 are the mean over their 5 directions per pair; per_direction only there."""
+    out: dict = {}
+    per_dir: dict = {}
+    for kind, v in vecs.items():
+        out[kind] = {}
+        for c in C_VALUES:
+            sign = 1 if c > 0 else -1
+            dirs = _dirs(kind, v, c, rand)
+            ms = [[_margin(model, cfg, c * d, sign, enc, lp0) for enc, lp0 in held] for d in dirs]
+            out[kind][c_key(c)] = [sum(col) / len(col) for col in zip(*ms)]
+            if len(dirs) > 1:
+                per_dir.setdefault(kind, {})[c_key(c)] = [sum(row) / len(row) if row else None for row in ms]
+    return out, per_dir
 
 
-def _kls(model, tok, cfg: TrainConfig, refs: list[RefAnswer],
-         vecs: dict[str, dict[str, Tensor]]) -> dict[str, dict[str, dict[str, list[float]]]]:
-    """KL(unsteered || steered) per reference answer; each answer's unsteered log-probs computed once."""
-    out = {s: {k: {c_key(c): [] for c in C_VALUES} for k in kv} for s, kv in vecs.items()}
+def _kls(model, tok, cfg: TrainConfig, refs: list[RefAnswer], vecs: dict[str, dict[str, Tensor]],
+         rand: dict[str, dict[str, list[Tensor]]]) -> tuple[dict, dict]:
+    """(kls[slug][kind][c] per reference answer, per_direction[slug][kind][c] = each random direction's mean KL).
+    KL(unsteered || steered); each answer's unsteered log-probs computed once. Random kinds at c = +-1 are the
+    mean over their 5 directions per answer."""
+    raw = {s: {k: {c_key(c): [[] for _ in _dirs(k, v, c, rand[s])] for c in C_VALUES} for k, v in kv.items()}
+           for s, kv in vecs.items()}
     for r in refs:
         ids, start = encode(tok, r.question, r.answer_text, cfg.max_answer_tokens)
         lp0 = answer_logprobs(model, ids, start)
         for s, kv in vecs.items():
             for kind, v in kv.items():
                 for c in C_VALUES:
-                    with steer(model, cfg.layer, c * v):
-                        lpc = answer_logprobs(model, ids, start)
-                    out[s][kind][c_key(c)].append(float(kl_loss(lp0, lpc)))
+                    for j, d in enumerate(_dirs(kind, v, c, rand[s])):
+                        with steer(model, cfg.layer, c * d):
+                            lpc = answer_logprobs(model, ids, start)
+                        raw[s][kind][c_key(c)][j].append(float(kl_loss(lp0, lpc)))
         del lp0
-    return out
+    out = {s: {k: {c: [sum(col) / len(col) for col in zip(*rows)] if rows[0] else [] for c, rows in cs.items()}
+               for k, cs in kd.items()} for s, kd in raw.items()}
+    per_dir = {s: {k: {c: [sum(row) / len(row) if row else None for row in rows]
+                       for c, rows in cs.items() if len(rows) > 1}
+                   for k, cs in kd.items() if k in rand[s]} for s, kd in raw.items()}
+    return out, per_dir
 
 
 def _cos(a: Tensor, b: Tensor) -> float:
@@ -227,7 +274,8 @@ def evaluate(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], trained
     slugs = [s for s in cfg.traits if s in trained]
     vecs = {s: vector_kinds(cfg, traits[s], trained[s]) for s in slugs}
     res: dict = {"run_name": cfg.run_name, "model": cfg.model, "layer": cfg.layer, "mode": cfg.mode,
-                 "c_values": list(C_VALUES), "kinds": list(KINDS), "n_kl_held": len(kl_held),
+                 "c_values": list(C_VALUES), "kinds": list(KINDS), "random_dirs": RANDOM_DIRS,
+                 "n_kl_held": len(kl_held),
                  "logprob_norm": cfg.logprob_norm,
                  "free_gen": {"enabled": bool(free_gen), "status": "pending" if free_gen else "disabled"},
                  "timing": {"teacher_forced_s": None, "free_gen_s": None},
@@ -239,9 +287,10 @@ def evaluate(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], trained
     with torch.no_grad():
         held = {s: _held_cache(model, tok, cfg, traits[s].held) for s in slugs}
         log(f"eval: margins on {[len(held[s]) for s in slugs]} held pairs, KL on {len(kl_held)} reference answers")
-        kls = _kls(model, tok, cfg, kl_held, vecs)
+        rand = {s: random_sets(cfg, vecs[s]) for s in slugs}
+        kls, kl_dirs = _kls(model, tok, cfg, kl_held, vecs, rand)
         for s in slugs:
-            margins = _margins(model, cfg, held[s], vecs[s])
+            margins, m_dirs = _margins(model, cfg, held[s], vecs[s], rand[s])
             kinds = {}
             for kind in KINDS:
                 kinds[kind] = {}
@@ -251,6 +300,9 @@ def evaluate(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], trained
                     km, ks = mean_se(kls[s][kind][k])
                     kinds[kind][k] = {"margin_mean": mm, "margin_se": ms, "kl_mean": km, "kl_se": ks,
                                       "margins": margins[kind][k], "kls": kls[s][kind][k]}
+                    if k in kl_dirs[s].get(kind, {}):  # random kinds at c = +-1: the 5 directions' means
+                        kinds[kind][k]["per_direction"] = kl_dirs[s][kind][k]
+                        kinds[kind][k]["per_direction_margin"] = m_dirs[kind][k]
             res["traits"][s] = {
                 "norms": {k: float(v.norm()) for k, v in vecs[s].items()},
                 "cos_with_source": {k: _cos(v, vecs[s]["source_full"]) for k, v in vecs[s].items()},

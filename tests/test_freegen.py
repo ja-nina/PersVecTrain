@@ -193,9 +193,87 @@ def test_vector_files_hold_the_right_tensors(run, monkeypatch):
         trained = torch.load(run["vec_dir"] / "vllm_hook" / f"{s}_L{LAYER}.pt")["dir"]
         assert torch.equal(torch.load(d / f"{s}_trained.pt")["dir"], trained)
         assert torch.equal(torch.load(d / f"{s}_source_full.pt")["dir"], torch.load(run["src"] / f"{s}.pt")[LAYER])
-        twin = torch.load(d / f"{s}_trained_random.pt")["dir"]
-        assert torch.equal(twin, random_control(trained, RANDOM_CONTROL_SEED + LAYER))
-        assert torch.equal(twin, torch.load(run["vec_dir"] / "vllm_hook" / f"{s}_L{LAYER}_random.pt")["dir"])
+        assert not (d / f"{s}_trained_random.pt").exists()
+        dirs = [torch.load(d / f"{s}_trained_random_k{k}.pt")["dir"] for k in range(5)]
+        for k, r in enumerate(dirs):
+            assert torch.equal(r, random_control(trained, RANDOM_CONTROL_SEED + LAYER + 1000 * k))
+            assert float(r.norm()) == pytest.approx(float(trained.norm()), rel=1e-5)
+        # k = 0 is the single twin of write_vectors
+        assert torch.equal(dirs[0], torch.load(run["vec_dir"] / "vllm_hook" / f"{s}_L{LAYER}_random.pt")["dir"])
+        assert len({tuple(r.tolist()) for r in dirs}) == 5
+
+
+def test_freegen_vectors_keeps_the_single_twin_for_kldepth(run):
+    v = fgm.freegen_vectors(run["cfg"], ["assertive"])["assertive"]
+    trained = torch.load(run["vec_dir"] / "vllm_hook" / f"assertive_L{LAYER}.pt")["dir"]
+    assert torch.equal(v["trained_random"], random_control(trained, RANDOM_CONTROL_SEED + LAYER))
+
+
+def test_trained_random_rotates_with_the_held_position(run, monkeypatch):
+    engine, _ = _fake(monkeypatch)
+    ev = _freegen(run, max_tokens=64)
+    d = (run["root"] / "freegen_vectors").resolve()
+    by_key = {r.key: r for r in _reqs(engine)}
+    for s in ("assertive", "calm"):
+        for c in (1.0, -1.0):
+            for i, q in enumerate(HELD):
+                assert by_key[(s, "trained_random", c, q)].steer["vector_path"] == str(d / f"{s}_trained_random_k{i % 5}.pt")
+                assert by_key[(s, "trained", c, q)].steer["vector_path"] == str(d / f"{s}_trained.pt")
+    t = ev["traits"]["assertive"]["free_gen"]
+    assert t["trained_random"]["c=+1"]["direction"] == [0, 1, 2] and "direction" not in t["trained"]["c=+1"]
+    assert ev["free_gen"]["random_dirs"] == 5
+    assert ev["free_gen"]["vectors"]["calm"]["trained_random"] == [str(d / f"calm_trained_random_k{k}.pt")
+                                                                   for k in range(5)]
+    assert ev["free_gen"]["vectors"]["calm"]["trained"] == str(d / "calm_trained.pt")
+    lines = _answers(run)
+    for ln in lines:
+        slug, kind, c, q = ln["key"]
+        if kind == "unsteered":
+            assert "vector" not in ln
+        elif kind == "trained_random":
+            assert ln["vector"] == f"{slug}_trained_random_k{HELD.index(q) % 5}.pt"
+        else:
+            assert ln["vector"] == f"{slug}_{kind}.pt"
+
+
+def test_old_trained_random_lines_without_vector_are_regenerated(run, monkeypatch):
+    _fake(monkeypatch)
+    _freegen(run, max_tokens=64)
+    path = run["root"] / fgm.ANSWERS_FILE
+    lines = _answers(run)
+    for ln in lines:  # a file from before the rotation: no "vector" on trained_random
+        if ln["key"][1] == "trained_random":
+            del ln["vector"]
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        f.write(_jsonl(lines))
+    engine, _ = _fake(monkeypatch)
+    _freegen(run, max_tokens=64)
+    regen = {r.key for r in _reqs(engine)}
+    assert regen == {(s, "trained_random", c, q) for s in ("assertive", "calm") for c in (1.0, -1.0) for q in HELD}
+    # a line naming another direction is not reused either
+    lines = [ln for ln in _answers(run) if ln["key"][1] != "trained_random" or "vector" in ln]
+    bad = next(ln for ln in lines if ln["key"][1] == "trained_random" and ln["key"][3] == "s4")
+    bad["vector"] = bad["vector"].replace("_k0", "_k3")
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        f.write(_jsonl(lines))
+    engine, _ = _fake(monkeypatch)
+    _freegen(run, max_tokens=64)
+    assert {r.key for r in _reqs(engine)} == {tuple(bad["key"])}
+
+
+def test_rescore_only_on_new_lines_and_refuses_old_random_lines(run, monkeypatch):
+    _fake(monkeypatch, _reply)
+    first = _freegen(run, max_tokens=64)
+    ev = _freegen(run, rescore_only=True)
+    assert ev["traits"] == first["traits"]
+    path = run["root"] / fgm.ANSWERS_FILE
+    lines = _answers(run)
+    for ln in lines:
+        ln.pop("vector", None)
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        f.write(_jsonl(lines))
+    with pytest.raises(SystemExit):
+        _freegen(run, rescore_only=True)
 
 
 # ---------------------------------------------------------------- results in eval.json

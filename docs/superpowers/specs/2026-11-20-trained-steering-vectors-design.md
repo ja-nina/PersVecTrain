@@ -133,6 +133,12 @@ what helps?" ablation, then e.g. 0.1, 1, 10); its value is not fixed in this des
      (updated 2026-11-21: vLLM free generation, larger pool): answers to the 100 held-out SuperGPQA questions with vLLM (PersVecFast's steer engine; the model card's
      sampling, up to 15360 new tokens, the games' "ANSWER: <letter>" instruction), their mean length and accuracy next
      to unsteered. Run as a separate `freegen` step after `train`.
+   *(Updated 2026-11-22: 5 random directions.)* The random control is a set of 5 norm-matched random directions,
+   seeds `RANDOM_CONTROL_SEED + layer + 1000 k`, k = 0..4 (k = 0 is the single twin used before); `trained_random`
+   and `source_random` keep their names. Teacher-forced, their margin and KL per item are the mean over the 5
+   directions at c = +-1 (the pass-rule c values); at c = +-0.5 only k = 0 is used (cost). The 5 per-direction KL
+   (and margin) means are stored in `kinds[...][c]["per_direction"]` (`per_direction_margin`), eval.json has
+   `"random_dirs": 5`.
    Written as one JSON per run plus a printed table.
 
    **Pass rule** (the user's choice: the strict version). A trait's trained vector passes when, on held-out data
@@ -142,7 +148,8 @@ what helps?" ablation, then e.g. 0.1, 1, 10); its value is not fixed in this des
      to unsteered, and (accuracy@c, (updated 2026-11-21: vLLM free generation, larger pool)) **at least as accurate** as `source_full`, paired by question, a
      difference within 1 SE counts as a tie;
    - its reasoning cost (KL, length change, accuracy change) is **no worse than its own random twin's** (random
-     direction, same norm as the trained vector).
+     direction, same norm as the trained vector; from 2026-11-22 the twin's KL is the mean over 5 random directions
+     and its free-answer length comes from the rotation below; the form of the check is unchanged).
    *(Calls made by me.)* Held-out is small, so "at least as much" / "no worse" count a difference within 1 SE as a
    tie. A run's eval.json says pass / fail per trait and per check. Among the swept lambda_kl values, the one that
    passes for the most traits moves on to stages 2 and 3 (ties: the larger mean persona margin). If none passes for
@@ -208,6 +215,13 @@ steered request uses the same seed for every kind (paired). An answer is the las
 Per answer: tokens, whether it was cut, correct. With 100 questions the accuracy SE is about 0.05, so accuracy is back
 in the pass rule (accuracy@c above) next to persona margin, KL and length. Until `freegen` has run, a run's free-gen
 status is "pending" and the report shows it as not passed.
+
+*(Updated 2026-11-22: 5 random directions.)* `trained_random` answers rotate over the 5 random directions: the
+question at position i of the held list (train.json's order) uses direction k = i % 5, vector files
+`freegen_vectors/{slug}_trained_random_k{k}.pt` (no plain `{slug}_trained_random.pt`). Every saved answer line of a
+steered request carries the vector file name; a saved `trained_random` line is reused on resume only when its name is
+the expected one (older lines without it are regenerated). The per-trait free-gen block of `trained_random` lists the
+direction of each item (`"direction"`).
 
 ## Left to the builder
 
