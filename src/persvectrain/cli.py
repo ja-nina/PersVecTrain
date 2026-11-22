@@ -321,6 +321,20 @@ def cmd_kldepth(args) -> int:
     return 0 if res is not None else 1
 
 
+# ---------------------------------------------------------------- vecs
+
+
+def cmd_vecs(args) -> int:
+    from persvectrain.vecs import run_vecs
+
+    model = tok = None
+    if args.model:
+        meta = read_json(run_root(Path(args.out), args.runs[0]) / "train.json")
+        model, tok = load_model(meta["config"]["model"])
+    run_vecs(Path(args.out), args.runs, model=model, tok=tok, n_items=args.n)
+    return 0
+
+
 # ---------------------------------------------------------------- report
 
 
@@ -422,6 +436,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-name", required=True, dest="run_name")
     _add_eval_flags(p)
     p.set_defaults(func=cmd_eval)
+
+    p = sub.add_parser("vecs", help="what training changed in the vectors (trained - start), shared across traits?")
+    p.add_argument("--out", required=True, help="out root holding trained/<run_name>")
+    p.add_argument("--runs", nargs="+", required=True)
+    p.add_argument("--model", action="store_true",
+                   help="also load the model (GPU): logit lens and layer residual geometry")
+    p.add_argument("--n", type=int, default=40, help="KL reference answers for the residual geometry (with --model)")
+    p.set_defaults(func=cmd_vecs)
 
     from persvectrain.bench import BENCH
     p = sub.add_parser("bench", help="larger SuperGPQA accuracy check of a finished run on 500 new questions "

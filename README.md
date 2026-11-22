@@ -40,6 +40,15 @@ PersVecFast (extracted responses and activations) and imports its `persvecfast` 
   at c = +-1, paired seeds), resumable (`bench_answers.jsonl.gz`); writes `trained/<run>/bench.json` with the paired
   accuracy differences (trained - unsteered, source - unsteered, trained - source, random - unsteered). Not part of
   the pass rule; `report` prints its table for every listed run that has one
+- `vecs --out O --runs R1 R2 ... [--model] [--n 40]` - analysis, reads only: per trait the change training made
+  (trained - start vector; the start is the train-pairs mean difference training begins from), split into
+  rescaling along the start and rotation orthogonal to it, against the split noise (source_full - start, a null:
+  no training, other pairs); across traits the cosines and 1st-component share of the rotations (shared change?)
+  with the split-noise and random baselines, the shared direction u1 and how much of start / trained lies on it;
+  across runs the per-trait cosine of the changes. `--model` (GPU, `sbatch slurm/vecs.sbatch --out O --runs ...`)
+  adds a logit lens of u1 / the mean change and the geometry of the unsteered layer residuals on the KL reference
+  answers (energy in the top 1 / 8 / 64 PCs, variance vs random directions). Writes
+  `trained/analysis/vecs_<runs>.json`
 - `kldepth --out O --run-name R` - diagnostic, after `freegen`: KL(unsteered || steered) by answer position
   (tokens 0-512, 512-2048, 2048-4096, 4096-8192) on the run's saved unsteered free answers, teacher-forced, per
   trait x trained / source_full / trained_random x c = +-1, plus the paired source_full - trained per bucket.
