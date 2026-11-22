@@ -78,7 +78,7 @@ def _shift_diff(fg: dict, a: str, b: str, c: str) -> tuple[float | None, float |
 
 def _correct_diff(fg: dict, a: str, b: str, c: str) -> tuple[float | None, float | None]:
     """Paired mean and SE over questions of correct_a - correct_b (1 correct, 0 wrong or no answer)."""
-    xa, xb = fg[a][c]["correct"], fg[b][c]["correct"]
+    xa, xb = (fg[k]["correct"] if k == "unsteered" else fg[k][c]["correct"] for k in (a, b))
     if len(xa) != len(xb):
         raise ValueError(f"free-gen answers of {a} and {b} at {c} are not paired ({len(xa)} vs {len(xb)} questions)")
     return mean_se([float(x) - float(y) for x, y in zip(xa, xb)])
@@ -101,7 +101,8 @@ def pass_rule(trait_eval: dict) -> dict:
     persona: mean(trained - source_full margin) >= -SE; kl: mean(source_full - trained KL) > SE (a tie fails
     "less"); length, per question shift_k = |tokens_k - tokens_unsteered| (free answers are paired: one seed per
     (c, question) for every kind): mean(shift_source - shift_trained) > SE (a tie fails "less"); accuracy:
-    mean(correct_trained - correct_source_full) >= -SE (a tie passes "at least as accurate"); random:
+    mean(correct_trained - correct_source_full) >= -SE (a tie passes "at least as accurate"); accuracy-unsteered:
+    mean(correct_trained - correct_unsteered) >= -SE (no measurable loss against the unsteered model); random:
     mean(trained_random - trained KL) >= -SE and mean(shift_random - shift_trained) >= -SE (a tie passes "no
     worse"). Without free-generation results (status pending or disabled) the length and accuracy parts are
     skipped (named in "skipped"). Persona judge (`persona`, trait_eval["persona_judge"]; skipped when absent), paired
@@ -130,10 +131,12 @@ def pass_rule(trait_eval: dict) -> dict:
             ch["length"] = {"passed": m is not None and m > (se or 0.0), "diff_mean": m, "diff_se": se}
             m, se = _correct_diff(fg, "trained", "source_full", c)
             ch["accuracy"] = {"passed": m is not None and m >= -(se or 0.0), "diff_mean": m, "diff_se": se}
+            m, se = _correct_diff(fg, "trained", "unsteered", c)
+            ch["accuracy-unsteered"] = {"passed": m is not None and m >= -(se or 0.0), "diff_mean": m, "diff_se": se}
             m, se = _shift_diff(fg, "trained_random", "trained", c)
             rnd.update(length_passed=m is not None and m >= -(se or 0.0), length_diff_mean=m, length_diff_se=se)
         else:
-            skipped += [f"length@{c}", f"accuracy@{c}", f"random-length@{c}"]
+            skipped += [f"length@{c}", f"accuracy@{c}", f"accuracy-unsteered@{c}", f"random-length@{c}"]
         if pj:
             m, se, n = _judge_diff(pj, *(("trained", "source_full") if c == "c=+1" else ("source_full", "trained")),
                                    c, "score")
@@ -146,7 +149,8 @@ def pass_rule(trait_eval: dict) -> dict:
             skipped += [f"judge@{c}", f"coherence@{c}"]
         rnd["passed"] = rnd["kl_passed"] and rnd.get("length_passed", True)
         ch["random"] = rnd
-        failed += [f"{name}@{c}" for name in ("persona", "kl", "length", "accuracy", "random", "judge", "coherence")
+        failed += [f"{name}@{c}" for name in ("persona", "kl", "length", "accuracy", "accuracy-unsteered", "random", "judge",
+                                          "coherence")
                    if name in ch and not ch[name]["passed"]]
         checks[c] = ch
     return {"checks": checks, "failed": failed, "passed": not failed, "skipped": skipped}

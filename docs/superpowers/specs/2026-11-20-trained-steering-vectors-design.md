@@ -149,7 +149,8 @@ what helps?" ablation, then e.g. 0.1, 1, 10); its value is not fixed in this des
    - it moves the persona **at least as much** as the source vector (persona margin >= source);
    - it changes reasoning **less** than the source at the same c: lower KL, and free-generation length closer
      to unsteered, and (accuracy@c, (updated 2026-11-21: vLLM free generation, larger pool)) **at least as accurate** as `source_full`, paired by question, a
-     difference within 1 SE counts as a tie;
+     difference within 1 SE counts as a tie; and (accuracy-unsteered@c, added 2026-11-22) **at least as accurate**
+     as the unsteered model on the same questions, 1-SE ties;
    - its reasoning cost (KL, length change, accuracy change) is **no worse than its own random twin's** (random
      direction, same norm as the trained vector; from 2026-11-22 the twin's KL is the mean over 5 random directions
      and its free-answer length comes from the rotation below; the form of the check is unchanged).

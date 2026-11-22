@@ -55,7 +55,7 @@ def test_pass_rule_all_better_passes():
     assert r["passed"] is True and r["failed"] == []
     assert r["skipped"] == ["judge@c=+1", "coherence@c=+1", "judge@c=-1", "coherence@c=-1"]  # no persona judge
     assert set(r["checks"]) == {"c=+1", "c=-1"}
-    assert set(r["checks"]["c=+1"]) == {"persona", "kl", "length", "accuracy", "random"}
+    assert set(r["checks"]["c=+1"]) == {"persona", "kl", "length", "accuracy", "accuracy-unsteered", "random"}
     assert all(chk["passed"] for c in r["checks"].values() for chk in c.values())
 
 
@@ -151,15 +151,18 @@ def test_pass_rule_without_free_gen_skips_length():
     te = _trait_eval([2] * 4, [1] * 4, [0.1] * 4, [1.0] * 4, [0.5] * 4, None)
     r = ev.pass_rule(te)
     assert r["passed"] is True
-    assert r["skipped"] == ["length@c=+1", "accuracy@c=+1", "random-length@c=+1", "judge@c=+1", "coherence@c=+1",
-                            "length@c=-1", "accuracy@c=-1", "random-length@c=-1", "judge@c=-1", "coherence@c=-1"]
+    assert r["skipped"] == ["length@c=+1", "accuracy@c=+1", "accuracy-unsteered@c=+1", "random-length@c=+1",
+                            "judge@c=+1", "coherence@c=+1", "length@c=-1", "accuracy@c=-1",
+                            "accuracy-unsteered@c=-1", "random-length@c=-1", "judge@c=-1", "coherence@c=-1"]
     assert "length" not in r["checks"]["c=+1"] and "accuracy" not in r["checks"]["c=+1"]
 
 
-def _acc_eval(trained_correct, source_correct) -> dict:
+def _acc_eval(trained_correct, source_correct, unsteered_correct=None) -> dict:
+    """unsteered defaults to the trained answers (the accuracy-unsteered check ties)."""
     n = len(trained_correct)
     return _trait_eval([2] * n, [1] * n, [0.1] * n, [1.0] * n, [0.5] * n, GOOD_TOKENS,
-                       correct={"trained": trained_correct, "source_full": source_correct})
+                       correct={"trained": trained_correct, "source_full": source_correct,
+                                "unsteered": unsteered_correct or trained_correct})
 
 
 def test_pass_rule_accuracy_tie_within_one_se_passes():
@@ -172,10 +175,24 @@ def test_pass_rule_accuracy_tie_within_one_se_passes():
 
 def test_pass_rule_accuracy_lower_beyond_one_se_fails():
     # 0, -1, -1, -1, -1, 0: mean -2/3, SE about 0.21
-    r = ev.pass_rule(_acc_eval([1, 0, 0, 0, 0, 1], [1, 1, 1, 1, 1, 1]))
+    r = ev.pass_rule(_acc_eval([1, 0, 0, 0, 0, 1], [1, 1, 1, 1, 1, 1], [1] * 6))
     acc = r["checks"]["c=+1"]["accuracy"]
     assert acc["diff_mean"] == pytest.approx(-2 / 3) and acc["diff_mean"] < -acc["diff_se"]
-    assert r["failed"] == ["accuracy@c=+1", "accuracy@c=-1"] and r["passed"] is False
+    assert r["failed"] == ["accuracy@c=+1", "accuracy-unsteered@c=+1", "accuracy@c=-1", "accuracy-unsteered@c=-1"]
+    assert r["passed"] is False
+
+
+def test_pass_rule_accuracy_against_unsteered():
+    # trained as accurate as the source, both clearly below unsteered: only the unsteered check fails
+    te = _trait_eval([2] * 6, [1] * 6, [0.1] * 6, [1.0] * 6, [0.5] * 6, GOOD_TOKENS,
+                     correct={"unsteered": [1] * 6, "trained": [1, 0, 0, 0, 0, 1], "source_full": [1, 0, 0, 0, 0, 1]})
+    r = ev.pass_rule(te)
+    assert r["failed"] == ["accuracy-unsteered@c=+1", "accuracy-unsteered@c=-1"]
+    assert r["checks"]["c=+1"]["accuracy-unsteered"]["diff_mean"] == pytest.approx(-2 / 3)
+    # trained better than unsteered passes
+    te = _trait_eval([2] * 4, [1] * 4, [0.1] * 4, [1.0] * 4, [0.5] * 4, GOOD_TOKENS,
+                     correct={"unsteered": [0, 0, 1, 0], "trained": [1, 1, 1, 0], "source_full": [1, 1, 1, 0]})
+    assert ev.pass_rule(te)["passed"] is True
 
 
 def test_pass_rule_free_gen_needs_the_same_questions():
