@@ -402,6 +402,18 @@ def test_old_reference_is_refused(run, monkeypatch):
         _freegen(run)
 
 
+def test_t2048_reference_is_accepted(run, monkeypatch):
+    _fake(monkeypatch)
+    path = run["root"] / "train.json"
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    ref = Path(meta["sources"]["reference"])
+    long = ref.with_name(f"{MODEL}_pool260_t2048.jsonl")
+    long.write_text(ref.read_text(encoding="utf-8"), encoding="utf-8")
+    meta["sources"]["reference"] = str(long)
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    fgm.held_questions(meta, run["pool"])  # no SystemExit
+
+
 def test_reference_differing_from_the_pool_is_refused(run, monkeypatch):
     _fake(monkeypatch)
     rows = [json.loads(l) for l in run["pool"].read_text(encoding="utf-8").splitlines()]

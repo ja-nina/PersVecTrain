@@ -378,3 +378,46 @@ def test_split_reference_160_100_deterministic():
     assert [r.id for r in held] == [r.id for r in cli.split_reference(refs, 0)[1]]
     assert [r.id for r in held] != [r.id for r in cli.split_reference(refs, 1)[1]]
     assert len(cli.split_reference(refs, 0, n_held=20)[0]) == 240
+
+
+def test_reference_path_kl_window(tmp_path):
+    ref = tmp_path / "trained" / "reference"
+    assert cli.reference_path(tmp_path, MODEL, 512) == ref / f"{MODEL}_pool260.jsonl"
+    assert cli.reference_path(tmp_path, MODEL, 2048) == ref / f"{MODEL}_pool260_t2048.jsonl"
+    assert cli.reference_meta_path(tmp_path, MODEL, 2048) == ref / f"{MODEL}_pool260_t2048.meta.json"
+
+
+def test_cli_reference_max_new_tokens(tiny, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_generate(model, tok, prompts, batch_size, max_new_tokens, **kw):
+        calls.append(max_new_tokens)
+        return ["a"] * len(prompts)
+
+    monkeypatch.setattr(cli, "_generate", fake_generate)
+    out = tmp_path / "out"
+    assert cli.main(["reference", "--model", MODEL, "--out", str(out), "--max-new-tokens", "2048"]) == 0
+    ref = out / "trained" / "reference"
+    assert calls == [2048] and (ref / f"{MODEL}_pool260_t2048.jsonl").exists()
+    assert not (ref / f"{MODEL}_pool260.jsonl").exists()
+    meta = json.loads((ref / f"{MODEL}_pool260_t2048.meta.json").read_text(encoding="utf-8"))
+    assert meta["max_new_tokens"] == 2048
+
+
+def test_cli_train_kl_tokens_needs_its_reference(tiny, out_root):
+    _fake_reference(out_root)  # the 512 file exists, the 2048 one does not
+    with pytest.raises(SystemExit) as e:
+        cli.main(_train_args(out_root, "--kl-tokens", "2048"))
+    assert f"--max-new-tokens 2048" in str(e.value) and "_pool260_t2048.jsonl" in str(e.value)
+    assert tiny == []  # failed before the model loaded
+    assert not (out_root / "trained" / "run1").exists()
+
+
+def test_old_train_json_config_reads_kl_tokens_512(tmp_path):
+    from persvectrain.output import config_dict, config_from_train_json
+    from persvectrain.train import TrainConfig
+    cfg = TrainConfig(model=MODEL, layer=1, mode="solo", traits=["a"], source=tmp_path, out=tmp_path, run_name="r")
+    d = config_dict(cfg)
+    assert d["kl_tokens"] == 512
+    del d["kl_tokens"]
+    assert config_from_train_json({"config": d}, tmp_path).kl_tokens == 512

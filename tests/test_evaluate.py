@@ -224,7 +224,7 @@ def _refs(n: int = 3) -> list[RefAnswer]:
 
 def _cfg(tmp_path: Path, **kw) -> TrainConfig:
     base = dict(model="qwen3.5-2b", layer=LAYER, mode="solo", traits=["t1"], source=tmp_path / "src",
-                out=tmp_path / "out", run_name="run", max_answer_tokens=MAX_TOK, seed=0)
+                out=tmp_path / "out", run_name="run", max_answer_tokens=MAX_TOK, kl_tokens=MAX_TOK, seed=0)
     base.update(kw)
     return TrainConfig(**base)
 

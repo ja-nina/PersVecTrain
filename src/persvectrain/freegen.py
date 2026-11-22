@@ -33,7 +33,8 @@ from persvectrain.train import RefAnswer, TrainConfig
 
 POOL = REPO / "data" / "supergpqa_pool.jsonl"
 MAX_TOKENS = 15360  # the games' max_tokens
-REFERENCE_SUFFIX = "_pool260.jsonl"  # cli.reference_path: the reference answers of the 260-question pool
+REFERENCE_SUFFIX = "_pool260.jsonl"
+REFERENCE_NAME_RE = re.compile(r"_pool260(_t\d+)?\.jsonl$")  # a longer / shorter KL window adds _t{N}  # cli.reference_path: the reference answers of the 260-question pool
 UNSTEERED = "unsteered"
 ANSWERS_FILE = "freegen_answers.jsonl.gz"  # in run_root: every saved answer, one gzip member per chunk
 SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty", "presence_penalty")
@@ -90,9 +91,9 @@ def held_questions(meta: dict, pool: Path) -> tuple[list[RefAnswer], dict[str, i
     differ from the pool (an old or rebuilt reference would otherwise be used silently).
     """
     ref_file = Path(meta["sources"]["reference"])
-    if not ref_file.name.endswith(REFERENCE_SUFFIX):
+    if not REFERENCE_NAME_RE.search(ref_file.name):
         raise SystemExit(f"freegen: the run's reference {ref_file} is not the 260-question pool's "
-                         f"(*{REFERENCE_SUFFIX}); retrain on the pool")
+                         f"(*{REFERENCE_SUFFIX} or *_pool260_t<N>.jsonl); retrain on the pool")
     refs = {r.id: r for r in load_reference(ref_file)}
     texts = {it["id"]: it for it in supergpqa_prompts(Path(pool))}
     n_options = pool_options(pool)

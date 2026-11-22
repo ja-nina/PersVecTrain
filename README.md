@@ -16,7 +16,8 @@ PersVecFast (extracted responses and activations) and imports its `persvecfast` 
   `extraction_model` / `negative_model` from its `{slug}.json`
 - `reference` - unsteered answers of the model to the 260-question SuperGPQA pool (records 200-299 + 340-499, `data/supergpqa_pool.jsonl`; 160 KL-train, 100 held-out), the KL term's reference, written as
   `<out>/trained/reference/<model>_pool260.jsonl` with its sampling settings and commits in `<model>_pool260.meta.json`
-- `train` - train vectors (`--mode solo` or `joint`) and write `train.json`, `steps.jsonl`, the vectors and
+  (`--max-new-tokens N`, default 512: other N write `<model>_pool260_t{N}.jsonl` / `.meta.json`, for a longer KL window)
+- `train` - train vectors (`--mode solo` or `joint`; `--kl-tokens N` reads the `_t{N}` reference and cuts the KL answers to N tokens, default 512; persona pairs stay at `--max-answer-tokens`) and write `train.json`, `steps.jsonl`, the vectors and
   `eval.json`
 - `eval` - re-run the evaluation of an existing run
 - `freegen --out O --run-name R` - free generation of a finished run on vLLM (unsteered, and per trait trained /

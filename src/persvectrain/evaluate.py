@@ -214,7 +214,7 @@ def _kls(model, tok, cfg: TrainConfig, refs: list[RefAnswer], vecs: dict[str, di
     raw = {s: {k: {c_key(c): [[] for _ in _dirs(k, v, c, rand[s])] for c in C_VALUES} for k, v in kv.items()}
            for s, kv in vecs.items()}
     for r in refs:
-        ids, start = encode(tok, r.question, r.answer_text, cfg.max_answer_tokens)
+        ids, start = encode(tok, r.question, r.answer_text, cfg.kl_tokens)
         lp0 = answer_logprobs(model, ids, start)
         for s, kv in vecs.items():
             for kind, v in kv.items():

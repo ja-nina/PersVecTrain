@@ -18,7 +18,7 @@ from persvectrain import data as data_mod
 from persvectrain.data import full_source_vector, load_pairs, start_vector, supergpqa_prompts, usable_traits
 from persvectrain.evaluate import evaluate
 from persvectrain.freegen import MAX_TOKENS as FREEGEN_MAX_TOKENS
-from persvectrain.freegen import POOL, REFERENCE_SUFFIX, run_freegen
+from persvectrain.freegen import POOL, run_freegen
 from persvectrain.generate import generate as _generate
 from persvectrain.output import (PERSVECFAST_REPO, REPO, build_train_json, config_from_train_json, git_commit,
                                  load_reference, load_trained, prepare_run, run_dir, run_root, source_dir,
@@ -42,13 +42,18 @@ def load_model(model_key: str):
     return load_hf(repo), AutoTokenizer.from_pretrained(repo)
 
 
-def reference_path(out: Path, model: str) -> Path:
-    return Path(out) / "trained" / "reference" / f"{model}{REFERENCE_SUFFIX}"
+def _reference_stem(model: str, tokens: int) -> str:
+    """`<model>_pool260`, plus `_t{tokens}` when the answers are longer or shorter than the default 512."""
+    return f"{model}_pool260" if tokens == REFERENCE_MAX_NEW_TOKENS else f"{model}_pool260_t{tokens}"
 
 
-def reference_meta_path(out: Path, model: str) -> Path:
+def reference_path(out: Path, model: str, tokens: int = REFERENCE_MAX_NEW_TOKENS) -> Path:
+    return Path(out) / "trained" / "reference" / f"{_reference_stem(model, tokens)}.jsonl"
+
+
+def reference_meta_path(out: Path, model: str, tokens: int = REFERENCE_MAX_NEW_TOKENS) -> Path:
     """Sampling settings and provenance of the reference answers, next to the jsonl."""
-    return Path(out) / "trained" / "reference" / f"{model}_pool260.meta.json"
+    return Path(out) / "trained" / "reference" / f"{_reference_stem(model, tokens)}.meta.json"
 
 
 # ---------------------------------------------------------------- check
@@ -89,7 +94,8 @@ def _write_jsonl_atomic(path: Path, rows: list[dict]) -> None:
 
 
 def cmd_reference(args) -> int:
-    path = reference_path(args.out, args.model)
+    n_new = args.max_new_tokens
+    path = reference_path(args.out, args.model, n_new)
     if path.exists():
         log(f"reference {path} exists; skipping")
         return 0
@@ -101,19 +107,19 @@ def cmd_reference(args) -> int:
         f"presence_penalty {spec.presence_penalty} is not applied in HF generate")
     seed = request_seed(args.model, "reference")
     torch.manual_seed(seed)
-    answers = _generate(model, tok, prompts, args.batch_size, REFERENCE_MAX_NEW_TOKENS,
+    answers = _generate(model, tok, prompts, args.batch_size, n_new,
                         temperature=spec.temperature, top_p=spec.top_p, top_k=spec.top_k)
     rows = [{"id": it["id"], "question": it["question"], "answer_text": a, "gold": it["answer"]}
             for it, a in zip(items, answers)]
     meta = {"model": args.model, "hf_repo": spec.hf_repo, "data": str(Path(args.data).resolve()),
             "temperature": spec.temperature, "top_p": spec.top_p, "top_k": spec.top_k,
             "presence_penalty": spec.presence_penalty, "presence_penalty_applied": False, "seed": seed,
-            "max_new_tokens": REFERENCE_MAX_NEW_TOKENS, "batch_size": args.batch_size, "n": len(rows),
+            "max_new_tokens": n_new, "batch_size": args.batch_size, "n": len(rows),
             "pool": REFERENCE_POOL,
             "persvectrain_commit": git_commit(REPO), "persvecfast_commit": git_commit(PERSVECFAST_REPO),
             "created": _now()}
     # meta first (atomic): the jsonl is what marks the reference done, so a jsonl never lacks its meta
-    write_json(reference_meta_path(args.out, args.model), meta)
+    write_json(reference_meta_path(args.out, args.model, n_new), meta)
     _write_jsonl_atomic(path, rows)
     log(f"reference: wrote {path}")
     return 0
@@ -158,10 +164,11 @@ def cmd_train(args) -> int:
     if root.exists():  # fail before any expensive work; prepare_run checks again
         raise FileExistsError(f"run {root} exists; pick another --run-name")
 
-    ref_file = reference_path(cfg.out, cfg.model)
+    ref_file = reference_path(cfg.out, cfg.model, cfg.kl_tokens)
     if not ref_file.exists():
         raise SystemExit(f"reference answers {ref_file} missing: run "
-                         f"`python -m persvectrain reference --model {cfg.model} --out {cfg.out}` first")
+                         f"`python -m persvectrain reference --model {cfg.model} --out {cfg.out} "
+                         f"--max-new-tokens {cfg.kl_tokens}` first")
     ref_train, ref_held = split_reference(load_reference(ref_file), cfg.seed)
 
     traits: dict[str, TraitData] = {}
@@ -176,7 +183,7 @@ def cmd_train(args) -> int:
                          "vectors": str(src / f"{slug}.pt"), "json": str(src / f"{slug}.json")}
         splits[slug] = {"train": [p.index for p in tr], "held": [p.index for p in held]}
     sources["reference"] = str(ref_file)
-    meta_file = reference_meta_path(cfg.out, cfg.model)
+    meta_file = reference_meta_path(cfg.out, cfg.model, cfg.kl_tokens)
     if meta_file.exists():
         sources["reference_meta"] = read_json(meta_file)
     else:
@@ -343,6 +350,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", required=True)
     p.add_argument("--out", required=True, help="out root; writes <out>/trained/reference/<model>.jsonl")
     p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--max-new-tokens", type=int, default=REFERENCE_MAX_NEW_TOKENS, dest="max_new_tokens",
+                   help="new tokens per answer; other than 512 writes <model>_pool260_t{N}.jsonl")
     p.add_argument("--data", default=str(REFERENCE_DATA))
     p.set_defaults(func=cmd_reference)
 

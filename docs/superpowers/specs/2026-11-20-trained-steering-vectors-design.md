@@ -93,6 +93,9 @@ traits, not double-count or cancel them (MAT-Steer).
   KL-train / 100 held-out (was 100 questions, 80/20). Records 0-199 (the games' questions) and 300-339
   (careful-reasoning) stay out. The unsteered model's own answers are generated once (HF, model card sampling) and
   cached as `<model>_pool260.jsonl`; the KL is over those answer tokens (teacher forcing), first 512 tokens.
+  KL window (2026-11-22): `reference --max-new-tokens N` makes `<model>_pool260_t{N}.jsonl` (N = 512 keeps the name
+  above); `TrainConfig.kl_tokens` (`--kl-tokens`, default 512) picks that file and cuts the KL answers to N tokens in
+  train and eval, while persona pairs stay at `max_answer_tokens`. train.json records `kl_tokens`; older ones read as 512.
   Risk: if the games sample questions past 199 they overlap this pool; check before reading game results as
   independent of the KL questions.
 

@@ -39,6 +39,7 @@ class TrainConfig:
     batch: int = 4
     kl_batch: int = 4
     max_answer_tokens: int = 512
+    kl_tokens: int = 512  # KL answers are cut to this many tokens; picks the reference file <model>_pool260_t{N}
     init: str = "dom"  # "dom" | "zero"
     mix_every: int = 2
     seed: int = 0
@@ -229,7 +230,7 @@ def _single_terms(model, cfg: TrainConfig, v: Tensor, sign: int, idx: list[int],
 def _encode_kl(tok, cfg: TrainConfig, kl_train: list[RefAnswer]) -> list[tuple]:
     if cfg.lambda_kl == 0:
         return []
-    return [encode(tok, r.question, r.answer_text, cfg.max_answer_tokens) for r in kl_train]
+    return [encode(tok, r.question, r.answer_text, cfg.kl_tokens) for r in kl_train]
 
 
 def _train_solo(model, tok, cfg, traits, kl_train, log_step) -> dict[str, Tensor]:

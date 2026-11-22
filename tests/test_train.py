@@ -34,7 +34,7 @@ def _refs(n: int = 3) -> list[RefAnswer]:
 def _cfg(**kw) -> TrainConfig:
     base = dict(model="tiny", layer=LAYER, mode="solo", traits=["t1"], source=Path("src"), out=Path("out"),
                 run_name="test", lambda_kl=0.0, epochs=3, lr=1e-2, batch=2, kl_batch=2,
-                max_answer_tokens=MAX_TOK, init="dom", seed=0)
+                max_answer_tokens=MAX_TOK, kl_tokens=MAX_TOK, init="dom", seed=0)
     base.update(kw)
     return TrainConfig(**base)
 
@@ -443,3 +443,19 @@ def test_logprob_norm_mean_divides_by_answer_tokens(tiny_model, char_tok):
     assert _steps(m_logs)[0]["margin"] == pytest.approx(_steps(s_logs)[0]["margin"] / 10, rel=1e-5)
     with pytest.raises(ValueError):
         train(tiny_model, char_tok, _cfg(logprob_norm="max"), {"t1": td}, _refs(), lambda d: None)
+
+
+def test_kl_tokens_truncates_kl_answers_not_persona_pairs():
+    from persvectrain.train import _encode_kl
+    from persvectrain.steering import encode as enc
+    tok = char_tok_for_test()
+    refs = [RefAnswer(id="r0", question="Q?", answer_text="x" * 40, gold="C")]
+    cfg = _cfg(kl_tokens=30, max_answer_tokens=12, lambda_kl=1.0)
+    ids, start = _encode_kl(tok, cfg, refs)[0]
+    assert ids.shape[1] - start == 30
+    assert enc(tok, "Q?", "x" * 40, cfg.max_answer_tokens)[0].shape[1] - start == 12  # persona pairs keep 12
+
+
+def char_tok_for_test():
+    from tests.conftest import CharTokenizer
+    return CharTokenizer()
