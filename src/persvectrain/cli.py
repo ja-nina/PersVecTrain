@@ -335,6 +335,22 @@ def cmd_vecs(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- analysis
+
+
+def cmd_analysis(args) -> int:
+    from persvectrain import analysis as an
+
+    names = args.runs or an.discover_runs(Path(args.out))
+    if not names:
+        print(f"analysis: no finished run under {Path(args.out) / 'trained'}")
+        return 1
+    rows = an.comparisons([an.load_run(Path(args.out), r) for r in names])
+    rot = None if args.no_vectors else an.rotation(Path(args.out), names)
+    print(an.format_report(rows, rot, args.z))
+    return 0
+
+
 # ---------------------------------------------------------------- report
 
 
@@ -491,6 +507,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--traits", nargs="+", default=None, help="display names (default all of the run's)")
     p.add_argument("--pool", default=str(POOL), help="the SuperGPQA pool file")
     p.set_defaults(func=cmd_kldepth)
+
+    p = sub.add_parser("analysis", help="every paired trained-vs-control comparison (bench, free answers, judge, "
+                                        "teacher-forced) summed over traits, the cells where trained is worse than "
+                                        "source, and the rotation; reads only")
+    p.add_argument("--out", required=True, help="out root holding trained/<run>")
+    p.add_argument("--runs", nargs="+", default=None, help="default: every finished run under <out>/trained")
+    p.add_argument("--z", type=float, default=2.0, help="|z| at which a trait cell counts as better / worse")
+    p.add_argument("--no-vectors", action="store_true", dest="no_vectors",
+                   help="leave out the rotation part (it reads the source *_raw.pt files)")
+    p.set_defaults(func=cmd_analysis)
 
     p = sub.add_parser("report", help="pass/fail table over runs and the best run")
     p.add_argument("--out", required=True, help="out root holding trained/<run>/eval.json")
