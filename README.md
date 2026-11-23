@@ -106,6 +106,13 @@ Controls: source, srcN (source direction at the trained length), unsteered, rand
 questions neither answer was cut. The random control is the same 5 unit directions for every trait and run; the
 report lists each direction against unsteered at c = +1 and -1. Reads only.
 
+Off-target: `python -m persvectrain offtarget --out OUT --run-names R ... [--c 1 [-1]]` judges a run's saved
+persona answers of trait s for every other trait t of the run (same OpenRouter judge and expression prompt as
+`persona`, no engine; per run about 7 x 5 x 49 x 6 = 10k judge calls at the default c = +1; resumes) and writes
+`offtarget.json` (eval.json untouched). `analysis` then adds `offtarget_shift`: per (t, question)
+|score_t(X) - score_t(unsteered)| - |score_t(trained) - score_t(unsteered)| (> 0: trained moves the other traits
+less) and a table of the mean shifts. Default c = +1 only: at c = -1 the answers carry s's eliciting prompt.
+
 `notebooks/analysis.ipynb` shows the same with plots (accuracy / trait / coherence per kind and run, per-trait
 heatmaps, the worse-than-source scan, rotation per trait, run-by-run cosines of the trained vectors and of the
 changes, the logit lens from saved `vecs --model` files, rotation angle vs gain over srcN). Without Jupyter:

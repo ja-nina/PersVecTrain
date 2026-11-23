@@ -113,6 +113,26 @@ def test_old_format_block_is_skipped(capsys):
     assert "old format" in capsys.readouterr().err
 
 
+def _ot(score):
+    return {"qid": ["a", "b"], "score": score}
+
+
+def test_offtarget_shift():
+    r = _run()
+    # evil's answers judged for "calm": unsteered 10, 10; trained moves it to 12, 10; source to 30, None
+    r["offtarget"] = {"c": ["c=+1"], "traits": {"evil": {"calm": {
+        "unsteered": _ot([10, 10]), "trained@c=+1": _ot([12, 10]), "source_full@c=+1": _ot([30, None]),
+        "trained_random@c=+1": _ot([10, 4])}}}}
+    rows = an.comparisons([r])
+    src = _get(rows, "offtarget_shift", "c=+1")
+    assert src["n"] == 1 and src["diff"] == pytest.approx(20 - 2)
+    assert src["trained_value"] == pytest.approx(2) and src["against_value"] == pytest.approx(20)
+    rnd = _get(rows, "offtarget_shift", "c=+1", "random")
+    assert rnd["n"] == 2 and rnd["diff"] == pytest.approx(((0 - 2) + (6 - 0)) / 2)
+    assert not [x for x in rows if x["metric"] == "offtarget_shift" and x["against"] == "srcN"]
+    assert "off-target" in an.format_report(rows, None)
+
+
 def test_unpaired_question_ids_raise():
     r = _run()
     r["bench"]["traits"]["evil"]["source_full"]["c=+1"]["qid"] = ["x"] * 4
@@ -161,7 +181,7 @@ def test_analysis_on_real_runs(out_two_runs, capsys):
     runs = [an.load_run(out, r) for r in ("run1", "run2")]
     assert runs[0]["bench"] is None and runs[1]["bench"] is not None
     rows = an.comparisons(runs)
-    assert {r["metric"] for r in rows} == set(an.METRICS)
+    assert {r["metric"] for r in rows} == set(an.METRICS) - {"offtarget_shift"}  # no offtarget.json here
     assert {r["metric"] for r in rows if r["run"] == "run1"} == {"tf_margin", "tf_kl"}
     assert {r["against"] for r in rows if r["metric"] == "tf_margin"} == {"source", "srcN", "random"}
     rot = an.rotation(out, ["run1", "run2"])

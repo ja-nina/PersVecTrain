@@ -14,6 +14,9 @@ One row per (metric, run, trait, c, against): diff = paired mean over items, ori
   judge_coherence  persona judge 0-100, coherence_trained - coherence_X
   tf_margin        teacher-forced held persona margin (eval.json, every c), margin_trained - margin_X
   tf_kl            teacher-forced KL on held reference answers, kl_X - kl_trained (smaller KL = better)
+  offtarget_shift  persona answers of trait s judged for every other trait t (offtarget.json): per (t, question)
+                   |score_t(X) - score_t(unsteered)| - |score_t(trained) - score_t(unsteered)| (trained moves the
+                   other traits less = better); items pooled over t, so the SE is optimistic
 against: source_full ("source"), source_at_trained_norm ("srcN", the source direction at the trained length),
 unsteered, trained_random (where the metric has them).
 """
@@ -31,7 +34,7 @@ from persvectrain.output import run_root
 SOURCE, SRCN, UNSTEERED, RANDOM = "source_full", "source_at_trained_norm", "unsteered", "trained_random"
 SHORT = {SOURCE: "source", SRCN: "srcN", UNSTEERED: "unsteered", RANDOM: "random"}
 METRICS = ("bench_acc", "bench_acc_uncut", "bench_cut", "bench_len", "fg_acc", "fg_acc_uncut", "fg_cut",
-           "judge_trait", "judge_coherence", "tf_margin", "tf_kl")
+           "judge_trait", "judge_coherence", "tf_margin", "tf_kl", "offtarget_shift")
 
 
 # ---------------------------------------------------------------- loading
@@ -54,9 +57,10 @@ def load_run(out: Path, run: str) -> dict:
     """{"name", "config", "train", "eval", "bench" (None if not benched)} of one run."""
     root = run_root(Path(out), run)
     meta = read_json(root / "train.json")
-    bench = root / "bench.json"
+    bench, ot = root / "bench.json", root / "offtarget.json"
     return {"name": run, "config": meta["config"], "train": meta, "eval": read_json(root / "eval.json"),
-            "bench": read_json(bench) if bench.is_file() else None}
+            "bench": read_json(bench) if bench.is_file() else None,
+            "offtarget": read_json(ot) if ot.is_file() else None}
 
 
 def label(run: dict) -> dict:
@@ -198,6 +202,39 @@ def teacher_forced_rows(run: dict) -> list[dict]:
     return rows
 
 
+def _abs_shift(x: list, u: list) -> list:
+    return [None if a is None or b is None else abs(float(a) - float(b)) for a, b in zip(x, u)]
+
+
+def offtarget_rows(run: dict) -> list[dict]:
+    """offtarget_shift rows of one run (none without offtarget.json); trained_value / against_value are the mean
+    |shift| of trained / X over the other traits and questions."""
+    ot = run.get("offtarget")
+    if not ot:
+        return []
+    rows = []
+    for s, by_t in ot["traits"].items():
+        for c in ot["c"]:
+            for against in (SOURCE, SRCN, RANDOM):
+                xs, ts = [], []
+                for t, labs in by_t.items():
+                    u, tr, x = labs.get(UNSTEERED), labs.get(f"trained@{c}"), labs.get(f"{against}@{c}")
+                    if not (u and tr and x):
+                        continue
+                    if not (u["qid"] == tr["qid"] == x["qid"]):
+                        raise ValueError(f"{run['name']} offtarget {s}->{t} {c}: {against} not paired")
+                    xs += _abs_shift(x["score"], u["score"])
+                    ts += _abs_shift(tr["score"], u["score"])
+                if not xs:
+                    continue
+                m, se, n = paired(xs, ts)
+                keep = [(a, b) for a, b in zip(xs, ts) if a is not None and b is not None]
+                rows.append(_row("offtarget_shift", run, s, c, against, m, se, n,
+                                 trained_value=sum(b for _, b in keep) / len(keep) if keep else None,
+                                 against_value=sum(a for a, _ in keep) / len(keep) if keep else None))
+    return rows
+
+
 def random_direction_rows(run: dict) -> list[dict]:
     """Bench: each random direction k (question i uses k = i % 5; the same 5 unit directions for every trait and
     run, norm-matched) against the unsteered answers to the same questions, at c = +1 and -1:
@@ -234,7 +271,7 @@ def comparisons(runs: list[dict]) -> list[dict]:
     """All rows of all runs (see the module docstring)."""
     rows = []
     for r in runs:
-        rows += answer_rows(r, "bench") + answer_rows(r, "free_gen") + judge_rows(r) + teacher_forced_rows(r)
+        rows += answer_rows(r, "bench") + answer_rows(r, "free_gen") + judge_rows(r) + teacher_forced_rows(r)             + offtarget_rows(r)
     return rows
 
 
@@ -328,6 +365,22 @@ def format_report(rows: list[dict], rot: dict | None, z: float = 2.0, rand: list
         L.append(f"{'dir':>3} {'c':>5} {'random-unst':>11} {'cut share':>9} {'cells':>5}")
         for r in random_direction_summary(rand):
             L.append(f"{r['direction']:>3} {r['c'][2:]:>5} {r['mean_diff']:>+11.3f} {r['cut']:>9.3f} {r['cells']:>5}")
+    ot = [r for r in rows if r["metric"] == "offtarget_shift"]
+    if ot:
+        L.append("")
+        L.append("== off-target: mean |score_t - score_t(unsteered)| over the other traits t (judge 0-100; "
+                 "smaller = the other traits move less) ==")
+        L.append(f"{'run':<22} {'c':>5} {'trained':>8} {'source':>8} {'srcN':>8} {'random':>8}")
+        cell: dict[tuple, dict] = {}
+        for r in ot:
+            d = cell.setdefault((r["run"], r["c"]), {"trained": [], "source": [], "srcN": [], "random": []})
+            d["trained"].append(r["trained_value"])
+            d[r["against"]].append(r["against_value"])
+        for (run, c), d in sorted(cell.items()):
+            def m(k):
+                v = [x for x in d[k] if x is not None]
+                return f"{sum(v) / len(v):>8.1f}" if v else f"{'-':>8}"
+            L.append(f"{run:<22} {c[2:]:>5} {m('trained')} {m('source')} {m('srcN')} {m('random')}")
     if rot:
         L.append("")
         L.append("== rotation per run (mean over traits; degrees) ==")

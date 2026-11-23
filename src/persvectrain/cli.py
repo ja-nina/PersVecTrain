@@ -21,6 +21,7 @@ from persvectrain.freegen import MAX_TOKENS as FREEGEN_MAX_TOKENS
 from persvectrain.freegen import POOL, run_freegen
 from persvectrain.persona import MAX_TOKENS as PERSONA_MAX_TOKENS
 from persvectrain.persona import run_persona
+from persvectrain.offtarget import run_offtarget
 from persvectrain.generate import generate as _generate
 from persvectrain.output import (PERSVECFAST_REPO, REPO, build_train_json, config_from_train_json, git_commit,
                                  load_reference, load_trained, prepare_run, run_dir, run_root, source_dir,
@@ -284,6 +285,15 @@ def cmd_persona(args) -> int:
     return 0 if res is not None and res["persona_judge"]["status"] == "done" else 1
 
 
+def cmd_offtarget(args) -> int:
+    cs = tuple(float(c) for c in args.c)
+    rc = 0
+    for name in args.run_names:
+        res = run_offtarget(Path(args.out), name, cs=cs, judge_concurrency=args.judge_concurrency)
+        rc |= 0 if res is not None and res["n_unscored"] == 0 else 1
+    return rc
+
+
 # ---------------------------------------------------------------- freegen
 
 
@@ -499,6 +509,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fresh", action="store_true",
                    help="delete the run's persona_answers / persona_judged files first (default: resume)")
     p.set_defaults(func=cmd_persona)
+
+    p = sub.add_parser("offtarget", help="judge a run's saved persona answers of trait s for every OTHER trait of "
+                                         "the run (no engine; OpenRouter judge as `persona`); writes "
+                                         "offtarget.json, eval.json untouched")
+    p.add_argument("--out", required=True, help="out root holding trained/<run_name>")
+    p.add_argument("--run-names", required=True, nargs="+", dest="run_names")
+    p.add_argument("--c", nargs="+", default=["1"],
+                   help="steering signs to judge (default 1: at -1 the answers carry s's eliciting prompt)")
+    p.add_argument("--judge-concurrency", type=int, default=32, dest="judge_concurrency")
+    p.set_defaults(func=cmd_offtarget)
 
     p = sub.add_parser("kldepth", help="diagnostic: KL by answer position (0-512, 512-2048, ...) on the run's "
                                        "saved unsteered free answers; writes kl_depth.json only")
