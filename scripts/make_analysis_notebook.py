@@ -228,10 +228,8 @@ the per-trait changes vs the split-noise null and 1 / n_traits)?"""),
             out[(a, b)] = sum(x["delta_cos"].values()) / len(x["delta_cos"])
         return out
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    for ax, (M, t) in zip(axes, ((runs_matrix(mean_trained_cos), "trained vector, row run vs column run
-(cos, mean over traits)"),
-                                 (runs_matrix(mean_delta_cos), "change = trained - start, row run vs column run
-(cos, mean over traits)"))):
+    for ax, (M, t) in zip(axes, ((runs_matrix(mean_trained_cos), "trained vector: row run vs column run (cos)"),
+                                 (runs_matrix(mean_delta_cos), "change = trained - start: row vs column run (cos)"))):
         ax.imshow(M.values, cmap="RdBu", vmin=-1, vmax=1)
         ax.set_xticks(range(len(ORDER))); ax.set_xticklabels(ORDER, rotation=70, fontsize=8)
         ax.set_yticks(range(len(ORDER))); ax.set_yticklabels(ORDER, fontsize=8)
