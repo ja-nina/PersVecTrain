@@ -345,9 +345,11 @@ def cmd_analysis(args) -> int:
     if not names:
         print(f"analysis: no finished run under {Path(args.out) / 'trained'}")
         return 1
-    rows = an.comparisons([an.load_run(Path(args.out), r) for r in names])
+    runs = [an.load_run(Path(args.out), r) for r in names]
+    rows = an.comparisons(runs)
+    rand = [x for r in runs for x in an.random_direction_rows(r)]
     rot = None if args.no_vectors else an.rotation(Path(args.out), names)
-    print(an.format_report(rows, rot, args.z))
+    print(an.format_report(rows, rot, args.z, rand))
     return 0
 
 

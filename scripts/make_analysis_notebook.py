@@ -108,6 +108,15 @@ def plot_diffs(metric, ylabel):
 
 plot_kinds("bench_acc", "accuracy")
 plot_diffs("bench_acc", "accuracy difference")"""),
+    md("""Is the accuracy loss reasoning or length? Share of bench answers cut at max_tokens (a cut answer has no ANSWER
+line and counts as wrong) per kind, and trained minus control on the questions where neither answer was cut."""),
+    code("""plot_kinds("bench_cut", "share of answers cut")
+plot_diffs("bench_acc_uncut", "accuracy difference, uncut questions only")"""),
+    md("""The random control: the same 5 random unit directions are used for every trait and run (norm-matched). Each
+direction against the unsteered answers to the same questions, at c=+1 and c=-1 (mean over runs x traits)."""),
+    code("""rand = pd.DataFrame([x for r in runs for x in an.random_direction_rows(r)])
+if len(rand):
+    display(rand.groupby(["direction", "c"])[["diff", "cut"]].mean().unstack("c").round(3))"""),
     md("""Per trait: trained minus source (left) and trained minus srcN (right) on the bench, per run and c. A cell marked
 `*` is measurably different (|z| >= Z)."""),
     code("""def heat(metric, against, ax, fmt="{:+.2f}"):

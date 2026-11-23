@@ -6,7 +6,9 @@ One row per (metric, run, trait, c, against): diff = paired mean over items, ori
 "trained is better than `against`", with its SE and z = diff / SE. Metrics:
   bench_acc        500 bench questions, correct_trained - correct_X
   bench_len        bench, length shift |tok_X - tok_unsteered| - |tok_trained - tok_unsteered| (smaller shift = better)
-  fg_acc           the 100 held SuperGPQA questions (eval.json free_gen), correct_trained - correct_X
+  bench_cut        bench, share of answers cut at max_tokens (no answer = wrong): cut_X - cut_trained
+  bench_acc_uncut  bench accuracy over the questions where neither answer was cut (is a loss reasoning or length?)
+  fg_acc, fg_cut, fg_acc_uncut   the same on the 100 held SuperGPQA questions (eval.json free_gen)
   judge_trait      persona judge 0-100: c=+1 score_trained - score_X (more trait), c=-1 score_X - score_trained
                    (suppresses more)
   judge_coherence  persona judge 0-100, coherence_trained - coherence_X
@@ -27,7 +29,8 @@ from persvectrain.output import run_root
 
 SOURCE, SRCN, UNSTEERED, RANDOM = "source_full", "source_at_trained_norm", "unsteered", "trained_random"
 SHORT = {SOURCE: "source", SRCN: "srcN", UNSTEERED: "unsteered", RANDOM: "random"}
-METRICS = ("bench_acc", "bench_len", "fg_acc", "judge_trait", "judge_coherence", "tf_margin", "tf_kl")
+METRICS = ("bench_acc", "bench_acc_uncut", "bench_cut", "bench_len", "fg_acc", "fg_acc_uncut", "fg_cut",
+           "judge_trait", "judge_coherence", "tf_margin", "tf_kl")
 
 
 # ---------------------------------------------------------------- loading
@@ -91,8 +94,14 @@ def _shift(tok: list, unst: list) -> list:
     return [abs(float(t) - float(u)) for t, u in zip(tok, unst)]
 
 
+def _uncut(a: dict, b: dict) -> tuple[list, list]:
+    """correct lists of a and b over the questions where neither answer was cut."""
+    keep = [i for i in range(len(a["correct"])) if not a["cut"][i] and not b["cut"][i]]
+    return [a["correct"][i] for i in keep], [b["correct"][i] for i in keep]
+
+
 def answer_rows(run: dict, part: str) -> list[dict]:
-    """bench_acc / bench_len (part "bench") or fg_acc (part "free_gen") rows of one run."""
+    """bench_* (part "bench") or fg_* (part "free_gen") rows of one run."""
     if part == "bench":
         b = run["bench"]
         if not b:
@@ -101,7 +110,8 @@ def answer_rows(run: dict, part: str) -> list[dict]:
     else:
         traits = {s: t["free_gen"] for s, t in run["eval"]["traits"].items()
                   if isinstance(t.get("free_gen"), dict) and t["free_gen"].get(UNSTEERED)}
-    acc = "bench_acc" if part == "bench" else "fg_acc"
+    pre = "bench" if part == "bench" else "fg"
+    acc = f"{pre}_acc"
     rows = []
     for s, t in traits.items():
         for c in ("c=+1", "c=-1"):
@@ -117,6 +127,16 @@ def answer_rows(run: dict, part: str) -> list[dict]:
                 m, se, n = paired(tr["correct"], x["correct"])
                 rows.append(_row(acc, run, s, c, against, m, se, n,
                                  trained_value=tr["accuracy"], against_value=x["accuracy"]))
+                if "cut" in tr and "cut" in x:
+                    m, se, n = paired([float(v) for v in x["cut"]], [float(v) for v in tr["cut"]])
+                    rows.append(_row(f"{pre}_cut", run, s, c, against, m, se, n,
+                                     trained_value=sum(map(float, tr["cut"])) / len(tr["cut"]),
+                                     against_value=sum(map(float, x["cut"])) / len(x["cut"])))
+                    a_, b_ = _uncut(tr, x)
+                    m, se, n = paired(a_, b_)
+                    rows.append(_row(f"{pre}_acc_uncut", run, s, c, against, m, se, n,
+                                     trained_value=sum(map(float, a_)) / len(a_) if a_ else None,
+                                     against_value=sum(map(float, b_)) / len(b_) if b_ else None))
                 if part == "bench" and against != UNSTEERED:
                     u = t[UNSTEERED]["tokens"]
                     m, se, n = paired(_shift(x["tokens"], u), _shift(tr["tokens"], u))
@@ -168,6 +188,38 @@ def teacher_forced_rows(run: dict) -> list[dict]:
                 rows.append(_row("tf_kl", run, s, c, against, m, se, n,
                                  trained_value=tr["kl_mean"], against_value=x["kl_mean"]))
     return rows
+
+
+def random_direction_rows(run: dict) -> list[dict]:
+    """Bench: each random direction k (question i uses k = i % 5; the same 5 unit directions for every trait and
+    run, norm-matched) against the unsteered answers to the same questions, at c = +1 and -1:
+    diff = correct_random - correct_unsteered (> 0: the random direction helps), and its cut share."""
+    b = run["bench"]
+    if not b:
+        return []
+    u = b["unsteered"]
+    rows = []
+    for s, t in b["traits"].items():
+        for c in ("c=+1", "c=-1"):
+            r = (t.get(RANDOM) or {}).get(c)
+            if r is None or "direction" not in r:
+                continue
+            for k in sorted(set(r["direction"])):
+                idx = [i for i, d in enumerate(r["direction"]) if d == k]
+                m, se, n = paired([r["correct"][i] for i in idx], [u["correct"][i] for i in idx])
+                rows.append({"run": run["name"], "lambda_kl": run["config"].get("lambda_kl"), "trait": s, "c": c,
+                             "direction": k, "diff": m, "se": se, "n": n,
+                             "cut": sum(float(r["cut"][i]) for i in idx) / len(idx)})
+    return rows
+
+
+def random_direction_summary(rows: list[dict]) -> list[dict]:
+    """Per (direction, c): mean over all run x trait cells of the random-minus-unsteered accuracy and cut share."""
+    g: dict[tuple, list[dict]] = {}
+    for r in rows:
+        g.setdefault((r["direction"], r["c"]), []).append(r)
+    return [{"direction": k, "c": c, "mean_diff": sum(r["diff"] for r in rs) / len(rs),
+             "cut": sum(r["cut"] for r in rs) / len(rs), "cells": len(rs)} for (k, c), rs in sorted(g.items())]
 
 
 def comparisons(runs: list[dict]) -> list[dict]:
@@ -244,7 +296,7 @@ def _f(x, fmt="+.3f") -> str:
     return "-" if x is None else format(x, fmt)
 
 
-def format_report(rows: list[dict], rot: dict | None, z: float = 2.0) -> str:
+def format_report(rows: list[dict], rot: dict | None, z: float = 2.0, rand: list[dict] | None = None) -> str:
     L = ["== mean over traits, diff > 0 = trained better (better/worse = trait cells with |z| >= "
          f"{z:g}) =="]
     L.append(f"{'metric':<16} {'run':<22} {'against':<10} {'c':>2} {'mean':>8} {'+-se':>7} {'cells':>5} "
@@ -261,6 +313,13 @@ def format_report(rows: list[dict], rot: dict | None, z: float = 2.0) -> str:
         L.append(f"{r['metric']:<16} {r['run']:<22} {r['trait']:<15} {r['c']:>7} diff {_f(r['diff'])} "
                  f"+-{_f(r['se'], '.3f')} (z {r['z']:+.1f}; trained {_f(r['trained_value'], '.3f')}, "
                  f"source {_f(r['against_value'], '.3f')})")
+    if rand:
+        L.append("")
+        L.append("== bench: each random direction vs unsteered (mean over runs x traits; the same 5 directions "
+                 "everywhere) ==")
+        L.append(f"{'dir':>3} {'c':>5} {'random-unst':>11} {'cut share':>9} {'cells':>5}")
+        for r in random_direction_summary(rand):
+            L.append(f"{r['direction']:>3} {r['c'][2:]:>5} {r['mean_diff']:>+11.3f} {r['cut']:>9.3f} {r['cells']:>5}")
     if rot:
         L.append("")
         L.append("== rotation per run (mean over traits; degrees) ==")

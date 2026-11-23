@@ -16,7 +16,7 @@ QIDS = ["q0", "q1", "q2", "q3"]
 
 def _ans(correct, tokens):
     return {"qid": QIDS, "correct": correct, "tokens": tokens, "accuracy": sum(correct) / len(correct),
-            "mean_tokens": sum(tokens) / len(tokens)}
+            "mean_tokens": sum(tokens) / len(tokens), "cut": [t >= 150 for t in tokens]}
 
 
 def _judge(score, coh):
@@ -29,6 +29,8 @@ def _run():
     bench_trait = {
         "trained": {"c=+1": _ans([1, 1, 1, 0], [110, 90, 100, 100]), "c=-1": _ans([1, 0, 0, 0], [100] * 4)},
         "source_full": {"c=+1": _ans([0, 0, 0, 0], [200, 50, 100, 100]), "c=-1": _ans([1, 1, 1, 1], [100] * 4)},
+        "trained_random": {c: {**_ans([0, 1, 1, 0], [100, 100, 200, 100]), "direction": [0, 1, 0, 1]}
+                           for c in ("c=+1", "c=-1")},
     }
     pj = {"unsteered": _judge([10, 10, 10, 10], [90, 90, 90, 90]),
           "trained": {"c=+1": _judge([80, 80, 80, 80], [70, 70, 70, 70]),
@@ -66,10 +68,30 @@ def test_rows_are_oriented_so_positive_means_trained_better():
     assert all(r["lambda_kl"] == 5.0 and r["trait"] == "evil" for r in rows)
 
 
+def test_cut_and_uncut_accuracy():
+    rows = an.comparisons([_run()])
+    cut = _get(rows, "bench_cut", "c=+1")  # source cut 1 of 4, trained none
+    assert cut["diff"] == pytest.approx(0.25) and cut["against_value"] == pytest.approx(0.25)
+    unc = _get(rows, "bench_acc_uncut", "c=+1")  # questions 1-3: trained 1,1,0 vs source 0,0,0
+    assert unc["n"] == 3 and unc["diff"] == pytest.approx(2 / 3)
+
+
+def test_random_directions():
+    rows = an.random_direction_rows(_run())
+    # direction 0 = questions 0, 2: random 0, 1 vs unsteered 1, 0 -> 0; direction 1 = questions 1, 3: 1, 0 vs 1, 0
+    d = {(r["direction"], r["c"]): r for r in rows}
+    assert d[(0, "c=+1")]["diff"] == pytest.approx(0) and d[(0, "c=+1")]["cut"] == pytest.approx(0.5)
+    assert d[(1, "c=-1")]["diff"] == pytest.approx(0) and d[(1, "c=-1")]["n"] == 2
+    summ = an.random_direction_summary(rows)
+    assert len(summ) == 4 and all(x["cells"] == 1 for x in summ)
+    assert "each random direction" in an.format_report(an.comparisons([_run()]), None, 2.0, rows)
+
+
 def test_worse_and_summary():
     rows = an.comparisons([_run()])
     w = an.worse(rows, z=1.0)
-    assert [(r["metric"], r["c"]) for r in w] == [("bench_acc", "c=-1")]
+    # nothing is cut at c=-1, so the uncut accuracy is the same cell
+    assert sorted((r["metric"], r["c"]) for r in w) == [("bench_acc", "c=-1"), ("bench_acc_uncut", "c=-1")]
     assert w[0]["z"] == pytest.approx(-0.75 / 0.25)
     s = {(x["metric"], x["against"], x["c_sign"]): x for x in an.summary(rows, z=1.0)}
     assert s[("bench_acc", "source", "-")]["worse"] == 1 and s[("bench_acc", "source", "+")]["better"] == 1
@@ -163,3 +185,22 @@ def test_notebook_runs_on_real_runs(out_two_runs, monkeypatch):
         if cell.cell_type == "code":
             exec(compile(cell.source, "<cell>", "exec"), ns)
     assert ns["RUNS"] == ["run1", "run2"]
+
+
+def test_run_notebook_writes_pngs(out_two_runs, tmp_path, monkeypatch):
+    pytest.importorskip("pandas")
+    pytest.importorskip("matplotlib")
+    import importlib.util
+    from pathlib import Path
+
+    monkeypatch.setenv("PVT_OUT", str(out_two_runs))
+    path = Path(__file__).resolve().parents[1] / "scripts" / "run_notebook.py"
+    spec = importlib.util.spec_from_file_location("run_notebook", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    figs = tmp_path / "figs"
+    assert mod.main(["--dir", str(figs)]) == 0
+    pngs = sorted(figs.glob("*.png"))
+    assert len(pngs) >= 8 and all(p.stat().st_size > 1000 for p in pngs)
+    rep = (figs / "report.txt").read_text(encoding="utf-8")
+    assert "trained worse than source" in rep and "rotation" in rep.lower()
