@@ -104,6 +104,15 @@ def test_paired_skips_none_and_checks_length():
         an.paired([1], [1, 2])
 
 
+def test_old_format_block_is_skipped(capsys):
+    r = _run()
+    del r["bench"]["traits"]["evil"]["source_full"]["c=+1"]["qid"]
+    rows = an.comparisons([r])
+    assert not [x for x in rows if x["metric"] == "bench_acc" and x["c"] == "c=+1" and x["against"] == "source"]
+    assert _get(rows, "bench_acc", "c=-1")["diff"] == pytest.approx(-0.75)
+    assert "old format" in capsys.readouterr().err
+
+
 def test_unpaired_question_ids_raise():
     r = _run()
     r["bench"]["traits"]["evil"]["source_full"]["c=+1"]["qid"] = ["x"] * 4

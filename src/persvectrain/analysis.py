@@ -20,6 +20,7 @@ unsteered, trained_random (where the metric has them).
 from __future__ import annotations
 
 import math
+import sys
 from pathlib import Path
 
 from persvecfast.util import read_json
@@ -100,6 +101,10 @@ def _uncut(a: dict, b: dict) -> tuple[list, list]:
     return [a["correct"][i] for i in keep], [b["correct"][i] for i in keep]
 
 
+def _skip(msg: str) -> None:
+    print(f"analysis: skipped {msg}", file=sys.stderr)
+
+
 def answer_rows(run: dict, part: str) -> list[dict]:
     """bench_* (part "bench") or fg_* (part "free_gen") rows of one run."""
     if part == "bench":
@@ -121,6 +126,9 @@ def answer_rows(run: dict, part: str) -> list[dict]:
             for against in (SOURCE, SRCN, UNSTEERED, RANDOM):
                 x = _blk(t, against, c)
                 if x is None:
+                    continue
+                if "qid" not in x or "qid" not in tr:  # an old-format block (before per-question lists)
+                    _skip(f"{run['name']} {part} {s} {c} {SHORT[against]}: no per-question lists (old format)")
                     continue
                 if x["qid"] != tr["qid"]:
                     raise ValueError(f"{run['name']} {part} {s} {c}: {against} not paired with trained")
