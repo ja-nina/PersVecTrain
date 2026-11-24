@@ -4,3 +4,7 @@ __pycache__/
 slurm-logs/
 .cache/
 hle*
+bundle*/
+bundle*.tgz
+bundle*.log
+patterns/
