@@ -12,7 +12,9 @@ Writes <out-dir>/patterns_<name>.txt and <out-dir>/examples_<name>.md (disagreem
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
+import zlib
 import random
 import re
 from collections import Counter, defaultdict
@@ -54,6 +56,25 @@ def features(text: str, n_opt: int, gold: str, finish: str, n_tok: int) -> dict:
             "lex": {t: 1000 * len(r.findall(text)) / nw for t, r in LEX.items()}}
 
 
+def stream(path: Path, damaged: list):
+    """The answer lines one at a time (concatenated gzip members); a broken line is skipped and a cut last member
+    ends the read, both setting damaged[0]."""
+    try:
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    damaged[0] = True
+                    continue
+                if isinstance(d, dict) and all(k in d for k in fg.ANSWER_FIELDS):
+                    yield d
+                else:
+                    damaged[0] = True
+    except (EOFError, OSError, zlib.error):
+        damaged[0] = True
+
+
 def failure(f: dict) -> str:
     if f["loop"]:
         return "loop"
@@ -88,19 +109,18 @@ def main() -> None:
         if line.strip():
             r = json.loads(line)
             qs[r["id"]] = r
-    lines, damaged = fg.read_answers(Path(a.answers))
-    mt = Counter(ln["max_tokens"] for ln in lines).most_common(1)[0][0]
-    ans = {}
-    for ln in lines:
-        if ln["max_tokens"] == mt:
-            ans[tuple(ln["key"])] = ln
-    del lines
+    # streamed twice (features, then the example texts): the whole file never sits in memory
+    dmg = [False]
+    mts = Counter(ln["max_tokens"] for ln in stream(Path(a.answers), dmg))
+    mt = mts.most_common(1)[0][0]
     feats = {}
-    for k, ln in ans.items():
+    for ln in stream(Path(a.answers), dmg):
+        k = tuple(ln["key"])
         q = qs.get(k[3])
-        if q is None:
+        if ln["max_tokens"] != mt or q is None:
             continue
         feats[k] = features(ln["text"], len(q["options"]), q["answer"], ln["finish_reason"], ln["n_tokens"])
+    damaged = dmg[0]
 
     out = [f"{a.name}: {len(feats)} answers (max_tokens {mt}{', file damaged' if damaged else ''})", ""]
     cols = ("acc", "cut", "loop", "noANS", "tokens", "selfcorr", "hedge/1k", "=/100w", "changed")
@@ -161,11 +181,20 @@ def main() -> None:
     print("\n".join(out))
 
     rnd = random.Random(0)
-    md = [f"# {a.name}: trained vs source disagreements\n"]
+    picks = []
     for (lab, c), ps in sorted(pairs.items(), key=lambda x: (x[0][0], -x[0][1])):
         # prefer completed wrong answers (the reasoning errors), then the rest
         done = [p for p in ps if p[2] == "wrong letter"]
         pick = rnd.sample(done, min(a.examples, len(done))) or rnd.sample(ps, min(a.examples, len(ps)))
+        picks.append((lab, c, pick))
+    want = {kk for _, _, pick in picks for kt, ks, _ in pick for kk in (kt, ks)}
+    ans = {}
+    for ln in stream(Path(a.answers), [False]):
+        k = tuple(ln["key"])
+        if k in want and ln["max_tokens"] == mt:
+            ans[k] = ln
+    md = [f"# {a.name}: trained vs source disagreements\n"]
+    for lab, c, pick in picks:
         for kt, ks, mode in pick:
             q = qs[kt[3]]
             md += [f"## {lab}, c={c:+.0f}, trait {kt[0]}, {q['category']} / {q['field']} (loser: {mode})\n",
