@@ -310,7 +310,7 @@ def cmd_bench(args) -> int:
     from persvectrain.bench import run_bench
 
     res = run_bench(Path(args.out), args.run_name, questions=Path(args.questions), n=args.n,
-                    max_tokens=args.max_tokens, fresh=args.fresh)
+                    max_tokens=args.max_tokens, fresh=args.fresh, cs=tuple(args.c) if args.c else None)
     return 0 if res is not None else 1
 
 
@@ -481,7 +481,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--questions", default=str(BENCH), help="bench question file (scripts/make_bench.py)")
     p.add_argument("--n", type=int, default=None, help="only the first n questions (default all)")
     p.add_argument("--max-tokens", type=int, default=None, help=f"max new tokens (default {FREEGEN_MAX_TOKENS})")
-    p.add_argument("--fresh", action="store_true", help="delete the run's bench_answers.jsonl.gz first")
+    p.add_argument("--fresh", action="store_true", help="delete the run's bench answers file first")
+    p.add_argument("--c", type=float, nargs="+", default=None,
+                   help="other strengths, each with both signs (--c 2 3: c = +-2, +-3; default +-1); writes "
+                        "bench_c2_3.json and bench_answers_c2_3.jsonl.gz, the +-1 bench files are not touched")
     p.set_defaults(func=cmd_bench)
 
     p = sub.add_parser("freegen", help="free-generation check of a finished run on vLLM (fills eval.json's "

@@ -6,7 +6,9 @@
 #SBATCH --mem=64G
 #SBATCH --time=20:00:00
 #SBATCH --output=slurm-logs/pvt-%j.out
-# Usage: sbatch slurm/bench.sbatch --out O --run-name R [--n N]
+# Usage: sbatch slurm/bench.sbatch --out O --run-name R [--n N] [--c 2 3]
+#   --c: other strengths, each with both signs, in their own files (bench_c2.json / bench_answers_c2.jsonl.gz for
+#   --c 2); one job per --c value runs in parallel without sharing a file.
 # The larger SuperGPQA accuracy check (`bench`, 500 new questions) of a finished run; resumes from
 # bench_answers.jsonl.gz if a job is cut. Run `mkdir -p slurm-logs` first.
 set -euo pipefail

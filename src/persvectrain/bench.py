@@ -7,6 +7,9 @@ like `freegen`: vLLM-Hook steer engine, once unsteered, and per trait `trained`,
 (5 random directions, question i uses k = i % 5) and source_at_trained_norm (the source direction at the
 trained vector's length: the length control) at c = +1 and -1, neutral system prompt, thinking off as freegen,
 the games' max_tokens and the model card's sampling; one seed per (c, question) for every steered kind (paired).
+`cs` (CLI --c 2 3): other strengths instead, each with both signs (c = +-2, +-3), past the trained |c| = 1;
+answers and results then go to their own files (bench_files: bench_answers_c2_3.jsonl.gz, bench_c2_3.json), so
+the +-1 bench is never touched. Seeds follow the same rule (request_seed(seed, "freegen", c, qid)).
 
 Answers go to run_root/bench_answers.jsonl.gz (resumable, as freegen's file); results to run_root/bench.json with
 per-question lists and paired accuracy differences (trained - unsteered, source_full - unsteered, trained -
@@ -40,6 +43,19 @@ DIFFS = (("trained-unsteered", "trained", "unsteered"), ("source-unsteered", "so
 KINDS = (*FREE_GEN_KINDS, fg.NORM_MATCHED)
 
 
+def bench_files(cs: tuple[float, ...] | None = None) -> tuple[str, str]:
+    """(answers file, results file) of a bench at these strengths; the default +-1 bench keeps the plain names."""
+    if not cs:
+        return ANSWERS_FILE, OUT_FILE
+    tag = "_".join(f"{abs(c):g}" for c in cs)
+    return f"bench_answers_c{tag}.jsonl.gz", f"bench_c{tag}.json"
+
+
+def signed(cs: tuple[float, ...] | None) -> tuple[float, ...]:
+    """+-1 by default, else each strength with both signs, in order: (2, 3) -> (2, -2, 3, -3)."""
+    return FREE_GEN_C if not cs else tuple(x for c in cs for x in (abs(float(c)), -abs(float(c))))
+
+
 def bench_questions(path: Path, n: int | None = None) -> tuple[list[RefAnswer], dict[str, int]]:
     """The bench questions (first n, file order) as RefAnswer (question = the pool's prompt text) and option counts."""
     items = supergpqa_prompts(Path(path))[:n]
@@ -52,10 +68,10 @@ def _correct(block: dict) -> list[float]:
     return [float(x) for x in block["correct"]]
 
 
-def diffs(unsteered: dict, trait_fg: dict) -> dict:
-    """{c: {name: {"mean", "se"}}} of the paired accuracy differences (DIFFS) at c = +1 and -1."""
+def diffs(unsteered: dict, trait_fg: dict, cs: tuple[float, ...] = FREE_GEN_C) -> dict:
+    """{c: {name: {"mean", "se"}}} of the paired accuracy differences (DIFFS) at each c (default +1, -1)."""
     out = {}
-    for c in FREE_GEN_C:
+    for c in cs:
         k = c_key(c)
         blk = {"unsteered": unsteered, **{kind: trait_fg[kind][k] for kind in KINDS}}
         if any(b["qid"] != unsteered["qid"] for b in blk.values()):
@@ -68,7 +84,8 @@ def diffs(unsteered: dict, trait_fg: dict) -> dict:
 
 
 def run_bench(out: Path, run_name: str, questions: Path = BENCH, n: int | None = None,
-              max_tokens: int | None = None, open_engine=None, fresh: bool = False) -> dict | None:
+              max_tokens: int | None = None, open_engine=None, fresh: bool = False,
+              cs: tuple[float, ...] | None = None) -> dict | None:
     """Bench one finished run; returns bench.json's content, or None (with a message) when there is nothing to do."""
     root = run_root(Path(out), run_name)
     for name in ("train.json", "eval.json"):
@@ -92,13 +109,15 @@ def run_bench(out: Path, run_name: str, questions: Path = BENCH, n: int | None =
         raise SystemExit(f"bench: {len(overlap)} bench questions are in the run's KL reference split, e.g. "
                          f"{overlap[0]}; the bench set must be new questions")
     max_tokens = fg.MAX_TOKENS if max_tokens is None else max_tokens
-    answers_path = root / ANSWERS_FILE
+    answers_name, out_name = bench_files(cs)
+    cvals = signed(cs)
+    answers_path = root / answers_name
     if fresh and answers_path.exists():
         log(f"bench: --fresh: deleting {answers_path}")
         answers_path.unlink()
 
     spec = MODELS[cfg.model]
-    plan = fg.request_plan(cfg, held, slugs, KINDS)
+    plan = fg.request_plan(cfg, held, slugs, KINDS, cvals)
     lines, damaged = fg.read_answers(answers_path)
     if damaged:
         log(f"bench: {answers_path} was damaged (cut or partial line); kept {len(lines)} complete answers")
@@ -111,9 +130,9 @@ def run_bench(out: Path, run_name: str, questions: Path = BENCH, n: int | None =
         paths = fg.write_freegen_vectors(cfg, slugs)  # the same files freegen writes (deterministic)
     fg.write_norm_matched(cfg, slugs, paths)
     tok = fg.load_tokenizer(cfg.model)
-    reqs = [r for r in fg.build_requests(cfg, held, n_options, paths, tok, max_tokens, KINDS)
+    reqs = [r for r in fg.build_requests(cfg, held, n_options, paths, tok, max_tokens, KINDS, cvals)
             if r.key not in done]
-    log(f"bench {run_name}: {len(plan)} requests ({len(held)} questions, traits {slugs}), {max_tokens} new tokens, "
+    log(f"bench {run_name} at c = {list(cvals)}: {len(plan)} requests ({len(held)} questions, traits {slugs}), {max_tokens} new tokens, "
         f"{len(plan) - len(reqs)} saved in {answers_path.name}, {len(reqs)} to generate in chunks of "
         f"{spec.batch_size}")
     if reqs:
@@ -131,16 +150,16 @@ def run_bench(out: Path, run_name: str, questions: Path = BENCH, n: int | None =
     missing = [key for key, _ in plan if key not in done]
     if missing:
         raise RuntimeError(f"bench: the engine returned no answer for {len(missing)} requests, e.g. {missing[0]}")
-    unsteered, per_trait = fg.fold(done, held, n_options, slugs, KINDS)
-    res = {"run_name": run_name, "questions": str(Path(questions).resolve()), "n": len(held),
+    unsteered, per_trait = fg.fold(done, held, n_options, slugs, KINDS, cvals)
+    res = {"run_name": run_name, "questions": str(Path(questions).resolve()), "n": len(held), "cs": list(cvals),
            "engine": "vllm-hook (persvecfast.mia steer)", "max_tokens": max_tokens,
            "sampling": {k: v for k, v in asdict(spec).items() if k in fg.SAMPLING_FIELDS},
            "random_dirs": RANDOM_DIRS, "answers": str(answers_path.resolve()), "unsteered": unsteered,
            "traits": {s: {**{kind: v for kind, v in per_trait[s].items() if kind != "unsteered"},
-                          "diffs": diffs(unsteered, per_trait[s])} for s in slugs},
+                          "diffs": diffs(unsteered, per_trait[s], cvals)} for s in slugs},
            "timing": {"bench_s": round(time.monotonic() - t0, 2)}}
-    write_json(root / OUT_FILE, res)
-    log(f"bench {run_name}: wrote {root / OUT_FILE}")
+    write_json(root / out_name, res)
+    log(f"bench {run_name}: wrote {root / out_name}")
     print(format_bench(res), flush=True)
     return res
 
@@ -157,7 +176,7 @@ def format_bench(res: dict) -> str:
              f"{'trained-unst':>14} {'source-unst':>14} {'trained-source':>14} {'trained-srcN':>14} "
              f"{'random-unst':>14}"]
     for s, t in res["traits"].items():
-        for c in FREE_GEN_C:
+        for c in res.get("cs") or FREE_GEN_C:
             k = c_key(c)
             d = t["diffs"][k]
             nm = (t.get(fg.NORM_MATCHED) or {}).get(k, {}).get("accuracy")

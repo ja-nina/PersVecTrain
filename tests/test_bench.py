@@ -97,6 +97,37 @@ def test_cli_bench_and_report_section(run, monkeypatch, tmp_path, capsys):
     assert "bench run1: 4 SuperGPQA questions" in capsys.readouterr().out
 
 
+def test_bench_other_cs_own_files_and_seeds(run, monkeypatch, tmp_path):
+    """--c 2 3: c = +-2 and +-3 in bench_c2_3.json / bench_answers_c2_3.jsonl.gz; the +-1 files are not touched;
+    seeds are request_seed(seed, "freegen", c, qid) as at +-1 (paired across kinds), unsteered as before."""
+    q = _bench_file(tmp_path)
+    _fake(monkeypatch, _reply)
+    bm.run_bench(run["out"], "run1", questions=q, max_tokens=64)
+    base = {p.name: p.read_bytes() for p in (run["root"] / bm.OUT_FILE, run["root"] / bm.ANSWERS_FILE)}
+    engine, _ = _fake(monkeypatch, _reply)
+    res = bm.run_bench(run["out"], "run1", questions=q, max_tokens=64, cs=(2.0, 3.0))
+    reqs = _reqs(engine)
+    assert len(reqs) == len(BQ) * (1 + 4 * 2 * 4)  # unsteered + 2 traits x 4 kinds x c in +-2, +-3
+    assert {r.key[2] for r in reqs if r.key[1] != "unsteered"} == {2.0, -2.0, 3.0, -3.0}
+    by_key = {r.key: r for r in reqs}
+    assert by_key[("calm", "trained", -3.0, "b1")].steer["coeff"] == -3.0
+    assert {by_key[("assertive", k, 2.0, "b2")].seed for k in KINDS} == {request_seed(0, "freegen", 2.0, "b2")}
+    assert by_key[("-", "unsteered", 0.0, "b0")].seed == request_seed(0, "freegen", "unsteered", "b0")
+    assert {p.name: p.read_bytes() for p in (run["root"] / bm.OUT_FILE, run["root"] / bm.ANSWERS_FILE)} == base
+    saved = json.loads((run["root"] / "bench_c2_3.json").read_text(encoding="utf-8"))
+    assert saved["cs"] == [2.0, -2.0, 3.0, -3.0] and (run["root"] / "bench_answers_c2_3.jsonl.gz").exists()
+    t = res["traits"]["assertive"]
+    assert set(t["trained"]) == set(t["diffs"]) == {"c=+2", "c=-2", "c=+3", "c=-3"}
+    assert t["diffs"]["c=-3"]["trained-unsteered"]["mean"] == pytest.approx(-0.5)
+    out = bm.format_bench(res)
+    assert "c=+3" not in out and " -3 " in out  # rows per c, as at +-1
+    assert bm.bench_files((2.0, 3.0)) == ("bench_answers_c2_3.jsonl.gz", "bench_c2_3.json")
+    assert bm.bench_files() == (bm.ANSWERS_FILE, bm.OUT_FILE)
+    rc = cli.main(["bench", "--out", str(run["out"]), "--run-name", "run1", "--questions", str(q),
+                   "--max-tokens", "64", "--c", "2", "3"])
+    assert rc == 0
+
+
 def test_bench_file_in_repo_is_new_questions():
     """data/supergpqa_bench500.jsonl: 500 questions, none in the KL pool."""
     bench = [json.loads(l)["id"] for l in bm.BENCH.read_text(encoding="utf-8").splitlines() if l.strip()]

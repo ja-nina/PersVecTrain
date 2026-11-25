@@ -176,7 +176,7 @@ def vector_for(paths: dict[str, dict], slug: str, kind: str, pos: int) -> Path:
 
 
 def request_plan(cfg: TrainConfig, held: list[RefAnswer], slugs: list[str],
-                 kinds: tuple[str, ...] = FREE_GEN_KINDS) -> list[tuple[tuple, int]]:
+                 kinds: tuple[str, ...] = FREE_GEN_KINDS, cs: tuple[float, ...] = FREE_GEN_C) -> list[tuple[tuple, int]]:
     """(key, seed) of every free-gen request in order: unsteered once per held question, then per trait x kind x c;
     keys (slug | "-", kind, c, question id). trained_random's direction is not in the key: held position i uses
     random direction i % 5 (vector_for); saved answers carry the file name.
@@ -187,20 +187,20 @@ def request_plan(cfg: TrainConfig, held: list[RefAnswer], slugs: list[str],
     plan = [(("-", UNSTEERED, 0.0, r.id), request_seed(cfg.seed, "freegen", UNSTEERED, r.id)) for r in held]
     for slug in slugs:
         for kind in kinds:
-            for c in FREE_GEN_C:
+            for c in cs:
                 plan += [((slug, kind, c, r.id), request_seed(cfg.seed, "freegen", c, r.id)) for r in held]
     return plan
 
 
 def build_requests(cfg: TrainConfig, held: list[RefAnswer], n_options: dict[str, int],
                    vector_paths: dict[str, dict], tok, max_tokens: int = MAX_TOKENS,
-                   kinds: tuple[str, ...] = FREE_GEN_KINDS) -> list[Request]:
+                   kinds: tuple[str, ...] = FREE_GEN_KINDS, cs: tuple[float, ...] = FREE_GEN_C) -> list[Request]:
     """The requests of request_plan (traits = vector_paths' keys) with their prompts and steering."""
     prompts = {r.id: chat_prompt(tok, NEUTRAL_SYSTEM_PROMPT, r.question + instruction(n_options[r.id]), False)
                for r in held}
     pos = {r.id: i for i, r in enumerate(held)}
     reqs = []
-    for key, seed in request_plan(cfg, held, list(vector_paths), kinds):
+    for key, seed in request_plan(cfg, held, list(vector_paths), kinds, cs):
         slug, kind, c, qid = key
         steer = None if kind == UNSTEERED else \
             {"layer": cfg.layer, "coeff": c, "vector_path": str(vector_for(vector_paths, slug, kind, pos[qid]))}
@@ -313,7 +313,8 @@ def score(results: list[Result], held: list[RefAnswer], n_options: dict[str, int
 
 
 def fold(results: dict[tuple, Result], held: list[RefAnswer], n_options: dict[str, int],
-         slugs: list[str], kinds: tuple[str, ...] = FREE_GEN_KINDS) -> tuple[dict, dict[str, dict]]:
+         slugs: list[str], kinds: tuple[str, ...] = FREE_GEN_KINDS,
+         cs: tuple[float, ...] = FREE_GEN_C) -> tuple[dict, dict[str, dict]]:
     """(unsteered block, {slug: {"unsteered": ..., kind: {"c=+1": ..., "c=-1": ...}}})."""
     def block(slug: str, kind: str, c: float) -> dict:
         b = score([results[(slug, kind, c, q.id)] for q in held], held, n_options)
@@ -323,7 +324,7 @@ def fold(results: dict[tuple, Result], held: list[RefAnswer], n_options: dict[st
 
     unsteered = block("-", UNSTEERED, 0.0)
     per_trait = {s: {"unsteered": unsteered,
-                     **{kind: {c_key(c): block(s, kind, c) for c in FREE_GEN_C} for kind in kinds}}
+                     **{kind: {c_key(c): block(s, kind, c) for c in cs} for kind in kinds}}
                  for s in slugs}
     return unsteered, per_trait
 
