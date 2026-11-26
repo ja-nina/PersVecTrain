@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from persvectrain.losses import kl_loss, overlap_loss, persona_loss, persona_margin
+from persvectrain.losses import kl_from_logits, kl_loss, overlap_loss, persona_loss, persona_margin
 
 
 def _t(x):
@@ -44,6 +44,35 @@ def test_kl_shape_mismatch_asserts():
     b = torch.log_softmax(torch.randn(3, 7), dim=-1)
     with pytest.raises(AssertionError):
         kl_loss(a, b)
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 4, 256])
+def test_kl_from_logits_matches_kl_loss_value_and_gradient(chunk):
+    g = torch.Generator().manual_seed(0)
+    l0 = torch.randn(10, 7, generator=g)
+    lc_a = torch.randn(10, 7, generator=g, requires_grad=True)
+    lc_b = lc_a.detach().clone().requires_grad_(True)
+    ref = kl_loss(torch.log_softmax(l0, dim=-1), torch.log_softmax(lc_a, dim=-1))
+    ref.backward()
+    got = kl_from_logits(l0, lc_b, chunk=chunk)
+    got.backward()
+    assert got.item() == pytest.approx(ref.item(), rel=1e-6, abs=1e-7)
+    assert torch.allclose(lc_b.grad, lc_a.grad, rtol=1e-5, atol=1e-7)
+
+
+def test_kl_from_logits_bf16_logits_as_fp32_log_softmax():
+    g = torch.Generator().manual_seed(1)
+    l0 = torch.randn(9, 11, generator=g).to(torch.bfloat16)
+    lc = torch.randn(9, 11, generator=g).to(torch.bfloat16)
+    ref = kl_loss(torch.log_softmax(l0.float(), dim=-1), torch.log_softmax(lc.float(), dim=-1))
+    got = kl_from_logits(l0, lc, chunk=4)
+    assert got.dtype == torch.float32
+    assert got.item() == pytest.approx(ref.item(), rel=1e-6, abs=1e-7)
+
+
+def test_kl_from_logits_shape_mismatch_asserts():
+    with pytest.raises(AssertionError):
+        kl_from_logits(torch.randn(4, 7), torch.randn(3, 7))
 
 
 def test_overlap_orthogonal_parallel_single():

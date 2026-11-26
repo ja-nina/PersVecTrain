@@ -16,8 +16,8 @@ from persvecfast.models import request_seed
 from transformers import get_cosine_schedule_with_warmup
 
 from persvectrain.data import Pair
-from persvectrain.losses import kl_loss, overlap_loss, persona_loss, persona_margin
-from persvectrain.steering import LOGPROB_NORMS, answer_logprob, answer_logprobs, encode, steer
+from persvectrain.losses import kl_from_logits, overlap_loss, persona_loss, persona_margin
+from persvectrain.steering import LOGPROB_NORMS, answer_logits, answer_logprob, encode, steer
 
 
 @dataclass
@@ -191,10 +191,10 @@ def _kl_backward(model, layer: int, v: Tensor, sign: int, enc: tuple, scale: flo
     """Unsteered reference under no_grad, steered pass, KL(p_0 || p_c) backward; returns unscaled KL."""
     ids, s = enc
     with torch.no_grad():
-        lp0 = answer_logprobs(model, ids, s)
+        l0 = answer_logits(model, ids, s)
     with steer(model, layer, sign * v):
-        lpc = answer_logprobs(model, ids, s)
-    kl = kl_loss(lp0, lpc)
+        lc = answer_logits(model, ids, s)
+    kl = kl_from_logits(l0, lc)  # chunked kl_loss: no [T, V] fp32 tensors kept (long windows, large vocab)
     (kl * scale).backward()
     return float(kl.detach())
 

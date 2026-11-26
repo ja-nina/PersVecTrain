@@ -48,13 +48,17 @@ def encode(tok, question: str, answer: str, max_answer_tokens: int = 512):
     return torch.tensor([prompt_ids + answer_ids]), len(prompt_ids)
 
 
-def answer_logprobs(model, ids: torch.Tensor, start: int) -> torch.Tensor:
-    """fp32 log-softmax [T_answer, vocab] of the positions that predict ids[0, start:]."""
+def answer_logits(model, ids: torch.Tensor, start: int) -> torch.Tensor:
+    """Raw logits [T_answer, vocab] (model dtype) of the positions that predict ids[0, start:]."""
     assert ids.shape[0] == 1, "batch of one expected"
     T = ids.shape[1]
     # use_cache=False: one full pass per call, no KV cache kept alive (training / eval, never generate)
-    logits = model(ids.to(model.device), logits_to_keep=T - start + 1, use_cache=False).logits[0, :-1]
-    return torch.log_softmax(logits.float(), dim=-1)
+    return model(ids.to(model.device), logits_to_keep=T - start + 1, use_cache=False).logits[0, :-1]
+
+
+def answer_logprobs(model, ids: torch.Tensor, start: int) -> torch.Tensor:
+    """fp32 log-softmax [T_answer, vocab] of the positions that predict ids[0, start:]."""
+    return torch.log_softmax(answer_logits(model, ids, start).float(), dim=-1)
 
 
 LOGPROB_NORMS = ("sum", "mean")
