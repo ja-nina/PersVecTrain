@@ -477,3 +477,25 @@ def test_fix_norm_keeps_the_start_length_and_changes_the_direction(tiny_model, c
 def test_fix_norm_needs_dom_init(tiny_model, char_tok):
     with pytest.raises(ValueError, match="fix_norm"):
         train(tiny_model, char_tok, _cfg(init="zero", fix_norm=1), {"t1": _trait("t1")}, _refs(), lambda d: None)
+
+
+@pytest.mark.parametrize("mode", ["solo", "joint"])
+def test_grad_checkpoint_gives_the_same_vectors(tiny_model, char_tok, mode):
+    tds = {"t1": _trait("t1"), "t2": _trait("t2")}
+    kw = dict(mode=mode, traits=["t1", "t2"], lambda_kl=1.0)
+    plain = train(tiny_model, char_tok, _cfg(**kw), tds, _refs(), lambda d: None)
+    ckpt = train(tiny_model, char_tok, _cfg(**kw, grad_checkpoint=1), tds, _refs(), lambda d: None)
+    for s in tds:
+        assert torch.allclose(ckpt[s], plain[s], rtol=1e-5, atol=1e-6)
+
+
+def test_checkpoint_layers_wraps_only_later_layers_and_restores(tiny_model):
+    from persvecfast.smoke import decoder_layers
+    from persvectrain.steering import checkpoint_layers
+    layers = decoder_layers(tiny_model)
+    before = [l.__dict__.get("forward") for l in layers]
+    with checkpoint_layers(tiny_model, LAYER):
+        assert [("forward" in l.__dict__) for l in layers] == [i > LAYER for i in range(len(layers))]
+    assert [l.__dict__.get("forward") for l in layers] == before
+    with checkpoint_layers(tiny_model, LAYER, on=False):
+        assert not any("forward" in l.__dict__ for l in layers)

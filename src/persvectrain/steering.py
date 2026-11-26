@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import torch
+from torch.utils.checkpoint import checkpoint
 from persvecfast.prompts import NEUTRAL_SYSTEM_PROMPT, chat_prompt
 from persvecfast.smoke import decoder_layers
 
@@ -27,6 +28,36 @@ def steer(model, layer: int, vec: torch.Tensor | None):
         yield
     finally:
         handle.remove()
+
+
+@contextmanager
+def checkpoint_layers(model, after: int, on: bool = True):
+    """Decoder layers after `after` recompute their activations in the backward pass instead of keeping them
+    (torch checkpoint, non-reentrant), only while grad is enabled. Same value and gradient; less memory, more time.
+    Only the layers after the steered one need it: earlier ones keep nothing for the vector's gradient."""
+    if not on:
+        yield
+        return
+    wrapped = []
+    for layer in list(decoder_layers(model))[after + 1:]:
+        had = "forward" in layer.__dict__
+        orig = layer.forward
+
+        def fwd(*args, _orig=orig, **kwargs):
+            if not torch.is_grad_enabled():
+                return _orig(*args, **kwargs)
+            return checkpoint(_orig, *args, use_reentrant=False, **kwargs)
+
+        layer.forward = fwd
+        wrapped.append((layer, had, orig))
+    try:
+        yield
+    finally:
+        for layer, had, orig in wrapped:
+            if had:
+                layer.forward = orig
+            else:
+                del layer.forward
 
 
 def layer_type(model, layer: int) -> str:

@@ -17,7 +17,7 @@ from transformers import get_cosine_schedule_with_warmup
 
 from persvectrain.data import Pair
 from persvectrain.losses import kl_from_logits, overlap_loss, persona_loss, persona_margin
-from persvectrain.steering import LOGPROB_NORMS, answer_logits, answer_logprob, encode, steer
+from persvectrain.steering import LOGPROB_NORMS, answer_logits, answer_logprob, checkpoint_layers, encode, steer
 
 
 @dataclass
@@ -46,6 +46,7 @@ class TrainConfig:
     logprob_norm: str = "sum"  # "sum" (BiPO) | "mean": each answer's summed log-prob / its answer tokens
     min_pairs: int = 20  # traits with fewer kept pairs are dropped (as `check`)
     fix_norm: int = 0  # 1: after every optimizer step |v| is set back to |start| (direction-only training)
+    grad_checkpoint: int = 0  # 1: layers after `layer` recompute activations in backward (same result, less memory)
 
 
 @dataclass
@@ -86,9 +87,10 @@ def train(model, tok, cfg: TrainConfig, traits: dict[str, TraitData], kl_train: 
             raise ValueError(f"trait {slug} has no train pairs")
     model.requires_grad_(False)
     model.eval()
-    if cfg.mode == "solo":
-        return _train_solo(model, tok, cfg, traits, kl_train, log_step)
-    return _train_joint(model, tok, cfg, traits, kl_train, log_step)
+    with checkpoint_layers(model, cfg.layer, on=bool(cfg.grad_checkpoint)):
+        if cfg.mode == "solo":
+            return _train_solo(model, tok, cfg, traits, kl_train, log_step)
+        return _train_joint(model, tok, cfg, traits, kl_train, log_step)
 
 
 # ---------------------------------------------------------------- shared pieces
